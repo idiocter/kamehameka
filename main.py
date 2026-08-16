@@ -19,6 +19,9 @@ MIN_LOOP_RADIUS = 0.045    # normalized distance from center required to count a
 CHARGE_PER_REV = 18        # charge gained per full revolution
 MAX_CHARGE = 150
 CHARGE_DECAY = 2.5         # charge lost per frame while not actively circling
+MIN_CHARGE_TO_THROW = 15
+THROW_SPEED_MIN = 0.03     # normalized frame-to-frame speed that counts as a throwing swing
+THROW_RADIUS_MIN = 0.05    # must swing out this far from the orb's center to release it
 
 ORB_COLORS = [(60, 200, 255), (255, 170, 60)]  # BGR, per tracked hand slot
 
@@ -77,6 +80,7 @@ def main():
 
     slots = [fresh_slot() for _ in range(MAX_HANDS_TRACKED)]
     aura = FX.AuraParticles()
+    orbs = []
 
     frame_idx = 0
     connections = mp_hands.HAND_CONNECTIONS
@@ -116,6 +120,7 @@ def main():
                 continue
 
             cx, cy, _lm = hit
+            prev_pos = slot["last_pos"]
             slot["missing_frames"] = 0
 
             if slot["centroid"] is None:
@@ -146,8 +151,18 @@ def main():
             cenpx, cenpy = int(cenx * w), int(ceny * h)
             px, py = int(cx * w), int(cy * h)
             orb_radius = 12 + slot["charge"] * 0.55
+            speed = math.hypot(cx - prev_pos[0], cy - prev_pos[1]) if prev_pos else 0.0
 
-            if slot["charge"] > 0:
+            if (prev_pos and slot["charge"] >= MIN_CHARGE_TO_THROW
+                    and radius > THROW_RADIUS_MIN and speed > THROW_SPEED_MIN):
+                vx, vy = cx - prev_pos[0], cy - prev_pos[1]
+                n = math.hypot(vx, vy) + 1e-6
+                orbs.append(FX.KiBlast(px, py, vx / n, vy / n, color, speed=26, radius=int(orb_radius)))
+                slot["charge"] = 0.0
+                slot["swept_angle"] = 0.0
+                slot["prev_angle"] = None
+                slot["centroid"] = (cx, cy)
+            elif slot["charge"] > 0:
                 FX.draw_charge_orb(glow, cenpx, cenpy, orb_radius, color, frame_idx)
                 if radius > MIN_LOOP_RADIUS:
                     aura.emit(px, py, 10, n=2, color=color)
