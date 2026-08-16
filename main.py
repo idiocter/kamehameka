@@ -8,6 +8,7 @@ import mediapipe as mp
 mp_hands = mp.solutions.hands
 
 import gestures as G
+import effects as FX
 
 # --- tunables -------------------------------------------------------------
 MAX_HANDS_TRACKED = 2
@@ -18,6 +19,8 @@ MIN_LOOP_RADIUS = 0.045    # normalized distance from center required to count a
 CHARGE_PER_REV = 18        # charge gained per full revolution
 MAX_CHARGE = 150
 CHARGE_DECAY = 2.5         # charge lost per frame while not actively circling
+
+ORB_COLORS = [(60, 200, 255), (255, 170, 60)]  # BGR, per tracked hand slot
 
 
 def fresh_slot():
@@ -73,6 +76,9 @@ def main():
     )
 
     slots = [fresh_slot() for _ in range(MAX_HANDS_TRACKED)]
+    aura = FX.AuraParticles()
+
+    frame_idx = 0
     connections = mp_hands.HAND_CONNECTIONS
 
     while True:
@@ -84,6 +90,8 @@ def main():
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         result = hands.process(rgb)
+
+        glow = FX._glow_layer(frame.shape)
 
         raw_hands = result.multi_hand_landmarks if result.multi_hand_landmarks else []
         detections = [(*G.palm_center(hlm.landmark), hlm.landmark) for hlm in raw_hands]
@@ -98,6 +106,7 @@ def main():
         assigned = match_hands_to_slots(slots, detections)
 
         for i, slot in enumerate(slots):
+            color = ORB_COLORS[i % len(ORB_COLORS)]
             hit = assigned.get(i)
             if hit is None:
                 slot["missing_frames"] += 1
@@ -134,9 +143,24 @@ def main():
                 slot["swept_angle"] -= 2 * math.pi
                 slot["charge"] = min(MAX_CHARGE, slot["charge"] + CHARGE_PER_REV)
 
+            cenpx, cenpy = int(cenx * w), int(ceny * h)
+            px, py = int(cx * w), int(cy * h)
+            orb_radius = 12 + slot["charge"] * 0.55
+
+            if slot["charge"] > 0:
+                FX.draw_charge_orb(glow, cenpx, cenpy, orb_radius, color, frame_idx)
+                if radius > MIN_LOOP_RADIUS:
+                    aura.emit(px, py, 10, n=2, color=color)
+
             slot["last_pos"] = (cx, cy)
 
+        aura.update_and_draw(glow)
+
+        glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=6, sigmaY=6)
+        frame = FX.blend_additive(frame, glow)
+
         cv2.imshow("Energy Orb", frame)
+        frame_idx += 1
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
             break
