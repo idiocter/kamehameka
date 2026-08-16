@@ -27,9 +27,9 @@ MIN_LOOP_RADIUS = 0.045    # normalized distance from center required to count a
 CHARGE_PER_REV = 18        # charge gained per full revolution
 MAX_CHARGE = 150
 CHARGE_DECAY = 2.5         # charge lost per frame while not actively circling
-MIN_CHARGE_TO_THROW = 15
-THROW_SPEED_MIN = 0.03     # normalized frame-to-frame speed that counts as a throwing swing
-THROW_RADIUS_MIN = 0.05    # must swing out this far from the orb's center to release it
+MIN_CHARGE_TO_THROW = 30
+THROW_SPEED_MIN = 0.055    # normalized frame-to-frame speed that counts as a throwing swing
+THROW_RADIUS_MIN = 0.09    # must swing out this far from the orb's center to release it
 
 ORB_COLORS = [(60, 200, 255), (255, 170, 60)]  # BGR, per tracked hand slot
 
