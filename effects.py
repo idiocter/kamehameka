@@ -56,3 +56,29 @@ def draw_soft_glow_circle(glow, center, radius, color, intensity=1.0, rings=4):
         alpha = intensity * (1 - i / (rings + 1)) * 0.9
         c = tuple(int(ch * alpha) for ch in color)
         cv2.circle(glow, (cx, cy), max(1, r), c, -1, lineType=cv2.LINE_AA)
+
+
+class KiBlast:
+    """A projectile energy orb fired from the palm in a direction."""
+
+    def __init__(self, x, y, dx, dy, color, speed=22, radius=16, owner=None):
+        self.x, self.y = x, y
+        self.dx, self.dy = dx, dy
+        self.color = color
+        self.speed = speed
+        self.radius = radius
+        self.life = 60
+        self.owner = owner
+
+    def update(self):
+        self.x += self.dx * self.speed
+        self.y += self.dy * self.speed
+        self.life -= 1
+
+    def offscreen(self, w, h):
+        return self.life <= 0 or self.x < -50 or self.x > w + 50 or self.y < -50 or self.y > h + 50
+
+    def draw(self, glow):
+        draw_soft_glow_circle(glow, (self.x, self.y), self.radius, self.color, intensity=1.2, rings=5)
+        core = tuple(min(255, int(c * 1.5)) for c in self.color)
+        cv2.circle(glow, (int(self.x), int(self.y)), max(2, self.radius // 3), core, -1, lineType=cv2.LINE_AA)
