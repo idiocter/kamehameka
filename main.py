@@ -14,12 +14,19 @@ MAX_HANDS_TRACKED = 2
 MATCH_DIST = 0.18          # normalized distance to keep matching a hand to its tracked slot
 SLOT_TIMEOUT_FRAMES = 20   # frames a slot can go unmatched before its tracking resets
 CENTROID_EMA = 0.03        # how slowly the orb's center follows the circling hand
+MIN_LOOP_RADIUS = 0.045    # normalized distance from center required to count as "circling"
+CHARGE_PER_REV = 18        # charge gained per full revolution
+MAX_CHARGE = 150
+CHARGE_DECAY = 2.5         # charge lost per frame while not actively circling
 
 
 def fresh_slot():
     return {
         "last_pos": None,
         "centroid": None,
+        "prev_angle": None,
+        "swept_angle": 0.0,
+        "charge": 0.0,
         "missing_frames": 0,
     }
 
@@ -94,6 +101,7 @@ def main():
             hit = assigned.get(i)
             if hit is None:
                 slot["missing_frames"] += 1
+                slot["charge"] = max(0.0, slot["charge"] - CHARGE_DECAY)
                 if slot["missing_frames"] > SLOT_TIMEOUT_FRAMES:
                     slots[i] = fresh_slot()
                 continue
@@ -107,6 +115,24 @@ def main():
             cenx += (cx - cenx) * CENTROID_EMA
             ceny += (cy - ceny) * CENTROID_EMA
             slot["centroid"] = (cenx, ceny)
+
+            dx, dy = cx - cenx, cy - ceny
+            radius = math.hypot(dx, dy)
+
+            if radius > MIN_LOOP_RADIUS:
+                angle = math.atan2(dy, dx)
+                if slot["prev_angle"] is not None:
+                    delta = angle - slot["prev_angle"]
+                    delta = (delta + math.pi) % (2 * math.pi) - math.pi
+                    slot["swept_angle"] += abs(delta)
+                slot["prev_angle"] = angle
+            else:
+                slot["prev_angle"] = None
+                slot["charge"] = max(0.0, slot["charge"] - CHARGE_DECAY)
+
+            while slot["swept_angle"] >= 2 * math.pi:
+                slot["swept_angle"] -= 2 * math.pi
+                slot["charge"] = min(MAX_CHARGE, slot["charge"] + CHARGE_PER_REV)
 
             slot["last_pos"] = (cx, cy)
 
