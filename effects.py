@@ -46,3 +46,13 @@ class AuraParticles:
                 cv2.circle(glow, (int(x), int(y)), rad, c, -1, lineType=cv2.LINE_AA)
                 alive.append([x, y, vx, vy, life, max_life, color])
         self.particles = alive
+
+
+def draw_soft_glow_circle(glow, center, radius, color, intensity=1.0, rings=4):
+    """Simulate a soft glow by drawing several alpha-decreasing rings."""
+    cx, cy = int(center[0]), int(center[1])
+    for i in range(rings, 0, -1):
+        r = int(radius * i / rings)
+        alpha = intensity * (1 - i / (rings + 1)) * 0.9
+        c = tuple(int(ch * alpha) for ch in color)
+        cv2.circle(glow, (cx, cy), max(1, r), c, -1, lineType=cv2.LINE_AA)
