@@ -13,11 +13,13 @@ import gestures as G
 MAX_HANDS_TRACKED = 2
 MATCH_DIST = 0.18          # normalized distance to keep matching a hand to its tracked slot
 SLOT_TIMEOUT_FRAMES = 20   # frames a slot can go unmatched before its tracking resets
+CENTROID_EMA = 0.03        # how slowly the orb's center follows the circling hand
 
 
 def fresh_slot():
     return {
         "last_pos": None,
+        "centroid": None,
         "missing_frames": 0,
     }
 
@@ -98,6 +100,14 @@ def main():
 
             cx, cy, _lm = hit
             slot["missing_frames"] = 0
+
+            if slot["centroid"] is None:
+                slot["centroid"] = (cx, cy)
+            cenx, ceny = slot["centroid"]
+            cenx += (cx - cenx) * CENTROID_EMA
+            ceny += (cy - ceny) * CENTROID_EMA
+            slot["centroid"] = (cenx, ceny)
+
             slot["last_pos"] = (cx, cy)
 
         cv2.imshow("Energy Orb", frame)
