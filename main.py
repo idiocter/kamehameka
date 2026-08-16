@@ -188,6 +188,9 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
             break
+        if key == ord('r'):
+            slots = [fresh_slot() for _ in range(MAX_HANDS_TRACKED)]
+            orbs = []
 
     cap.release()
     cv2.destroyAllWindows()
