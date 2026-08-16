@@ -183,6 +183,9 @@ def main():
         glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=6, sigmaY=6)
         frame = FX.blend_additive(frame, glow)
 
+        cv2.putText(frame, "circle a hand to charge an orb - swing it outward to throw  r=reset  q=quit",
+                    (16, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+
         cv2.imshow("Energy Orb", frame)
         frame_idx += 1
         key = cv2.waitKey(1) & 0xFF
