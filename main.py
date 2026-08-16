@@ -171,6 +171,15 @@ def main():
 
         aura.update_and_draw(glow)
 
+        next_orbs = []
+        for orb in orbs:
+            orb.update()
+            if orb.offscreen(w, h):
+                continue
+            orb.draw(glow)
+            next_orbs.append(orb)
+        orbs = next_orbs
+
         glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=6, sigmaY=6)
         frame = FX.blend_additive(frame, glow)
 
