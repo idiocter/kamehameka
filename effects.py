@@ -82,3 +82,10 @@ class KiBlast:
         draw_soft_glow_circle(glow, (self.x, self.y), self.radius, self.color, intensity=1.2, rings=5)
         core = tuple(min(255, int(c * 1.5)) for c in self.color)
         cv2.circle(glow, (int(self.x), int(self.y)), max(2, self.radius // 3), core, -1, lineType=cv2.LINE_AA)
+
+
+def draw_charge_orb(glow, cx, cy, radius, color, pulse_t):
+    """Pulsing glowing orb used while an energy ball is forming."""
+    pulse = 1.0 + 0.15 * math.sin(pulse_t * 0.4)
+    draw_soft_glow_circle(glow, (cx, cy), radius * pulse, color, intensity=1.3, rings=6)
+    cv2.circle(glow, (int(cx), int(cy)), max(2, int(radius * 0.25)), (255, 255, 255), -1, lineType=cv2.LINE_AA)
