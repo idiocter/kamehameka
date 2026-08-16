@@ -34,12 +34,14 @@ THROW_RADIUS_MIN = 0.09    # must swing out this far from the orb's center to re
 ORB_COLORS = [(60, 200, 255), (255, 170, 60)]  # BGR, per tracked hand slot
 
 
+CHARGE_PER_RADIAN = CHARGE_PER_REV / (2 * math.pi)
+
+
 def fresh_slot():
     return {
         "last_pos": None,
         "centroid": None,
         "prev_angle": None,
-        "swept_angle": 0.0,
         "charge": 0.0,
         "missing_frames": 0,
     }
@@ -146,15 +148,11 @@ def main():
                 if slot["prev_angle"] is not None:
                     delta = angle - slot["prev_angle"]
                     delta = (delta + math.pi) % (2 * math.pi) - math.pi
-                    slot["swept_angle"] += abs(delta)
+                    slot["charge"] = min(MAX_CHARGE, slot["charge"] + abs(delta) * CHARGE_PER_RADIAN)
                 slot["prev_angle"] = angle
             else:
                 slot["prev_angle"] = None
                 slot["charge"] = max(0.0, slot["charge"] - CHARGE_DECAY)
-
-            while slot["swept_angle"] >= 2 * math.pi:
-                slot["swept_angle"] -= 2 * math.pi
-                slot["charge"] = min(MAX_CHARGE, slot["charge"] + CHARGE_PER_REV)
 
             cenpx, cenpy = int(cenx * w), int(ceny * h)
             px, py = int(cx * w), int(cy * h)
@@ -167,7 +165,6 @@ def main():
                 n = math.hypot(vx, vy) + 1e-6
                 orbs.append(FX.KiBlast(px, py, vx / n, vy / n, color, speed=26, radius=int(orb_radius)))
                 slot["charge"] = 0.0
-                slot["swept_angle"] = 0.0
                 slot["prev_angle"] = None
                 slot["centroid"] = (cx, cy)
             elif slot["charge"] > 0:
