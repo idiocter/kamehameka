@@ -1,5 +1,13 @@
 """
 Energy Orb: circle your hand to conjure a glowing ball of ki, then throw it.
+
+Move a hand in a circular motion in front of the camera - like winding up
+for a Kamehameha - and a glowing orb forms at the center of the circle,
+growing as you keep circling it. Once it's charged, swing your hand outward
+fast to throw the orb; it flies off in the direction of the throw and fades
+away. Works with either hand, or both at once for two orbs.
+
+Press 'r' to clear all orbs/charge. Press 'q' or ESC to quit.
 """
 import math
 
