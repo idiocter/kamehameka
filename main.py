@@ -1,13 +1,15 @@
 """
-Energy Orb: circle your hand to conjure a glowing ball of ki, then throw it.
+Energy Orb: circle your hand(s) to conjure a single glowing ball of ki, then throw it.
 
 Move a hand in a circular motion in front of the camera - like winding up
 for a Kamehameha - and a glowing orb forms at the center of the circle,
-growing as you keep circling it. Once it's charged, swing your hand outward
-fast to throw the orb; it flies off in the direction of the throw and fades
-away. Works with either hand, or both at once for two orbs.
+growing as you keep circling it. Use both hands together, circling in sync
+around the space between them, to charge the very same orb faster - it's
+always a single shared ball no matter how many hands are feeding it, never
+more than one at a time. Once it's charged, swing a hand outward fast to
+throw it; it flies off in the direction of the swing and fades away.
 
-Press 'r' to clear all orbs/charge. Press 'q' or ESC to quit.
+Press 'r' to clear the orb/charge. Press 'q' or ESC to quit.
 """
 import math
 
@@ -22,28 +24,33 @@ import effects as FX
 MAX_HANDS_TRACKED = 2
 MATCH_DIST = 0.18          # normalized distance to keep matching a hand to its tracked slot
 SLOT_TIMEOUT_FRAMES = 20   # frames a slot can go unmatched before its tracking resets
-CENTROID_EMA = 0.03        # how slowly the orb's center follows the circling hand
+CENTROID_EMA = 0.03        # how slowly the orb's center follows the circling hand(s)
 MIN_LOOP_RADIUS = 0.045    # normalized distance from center required to count as "circling"
-CHARGE_PER_REV = 18        # charge gained per full revolution
+CHARGE_PER_REV = 18        # charge gained per full revolution, per hand
+CHARGE_PER_RADIAN = CHARGE_PER_REV / (2 * math.pi)
 MAX_CHARGE = 150
-CHARGE_DECAY = 2.5         # charge lost per frame while not actively circling
+CHARGE_DECAY = 2.5         # charge lost per frame while nothing is circling
 MIN_CHARGE_TO_THROW = 30
 THROW_SPEED_MIN = 0.055    # normalized frame-to-frame speed that counts as a throwing swing
 THROW_RADIUS_MIN = 0.09    # must swing out this far from the orb's center to release it
 
-ORB_COLORS = [(60, 200, 255), (255, 170, 60)]  # BGR, per tracked hand slot
-
-
-CHARGE_PER_RADIAN = CHARGE_PER_REV / (2 * math.pi)
+ORB_COLOR = (60, 200, 255)  # BGR - single shared orb, single color
 
 
 def fresh_slot():
+    """Per-hand identity tracking (used to match detections frame-to-frame)."""
     return {
         "last_pos": None,
-        "centroid": None,
         "prev_angle": None,
-        "charge": 0.0,
         "missing_frames": 0,
+    }
+
+
+def fresh_orb_state():
+    """The single shared orb that all tracked hands feed into."""
+    return {
+        "centroid": None,
+        "charge": 0.0,
     }
 
 
@@ -89,6 +96,7 @@ def main():
     )
 
     slots = [fresh_slot() for _ in range(MAX_HANDS_TRACKED)]
+    orb_state = fresh_orb_state()
     aura = FX.AuraParticles()
     orbs = []
 
@@ -119,12 +127,12 @@ def main():
 
         assigned = match_hands_to_slots(slots, detections)
 
+        active = []  # (slot_idx, cx, cy, prev_pos) for every hand seen this frame
         for i, slot in enumerate(slots):
-            color = ORB_COLORS[i % len(ORB_COLORS)]
             hit = assigned.get(i)
             if hit is None:
                 slot["missing_frames"] += 1
-                slot["charge"] = max(0.0, slot["charge"] - CHARGE_DECAY)
+                slot["prev_angle"] = None
                 if slot["missing_frames"] > SLOT_TIMEOUT_FRAMES:
                     slots[i] = fresh_slot()
                 continue
@@ -132,49 +140,69 @@ def main():
             cx, cy, _lm = hit
             prev_pos = slot["last_pos"]
             slot["missing_frames"] = 0
-
-            if slot["centroid"] is None:
-                slot["centroid"] = (cx, cy)
-            cenx, ceny = slot["centroid"]
-            cenx += (cx - cenx) * CENTROID_EMA
-            ceny += (cy - ceny) * CENTROID_EMA
-            slot["centroid"] = (cenx, ceny)
-
-            dx, dy = cx - cenx, cy - ceny
-            radius = math.hypot(dx, dy)
-
-            if radius > MIN_LOOP_RADIUS:
-                angle = math.atan2(dy, dx)
-                if slot["prev_angle"] is not None:
-                    delta = angle - slot["prev_angle"]
-                    delta = (delta + math.pi) % (2 * math.pi) - math.pi
-                    slot["charge"] = min(MAX_CHARGE, slot["charge"] + abs(delta) * CHARGE_PER_RADIAN)
-                slot["prev_angle"] = angle
-            else:
-                slot["prev_angle"] = None
-                slot["charge"] = max(0.0, slot["charge"] - CHARGE_DECAY)
-
-            cenpx, cenpy = int(cenx * w), int(ceny * h)
-            px, py = int(cx * w), int(cy * h)
-            orb_radius = 12 + slot["charge"] * 0.55
-            speed = math.hypot(cx - prev_pos[0], cy - prev_pos[1]) if prev_pos else 0.0
-
-            if (prev_pos and slot["charge"] >= MIN_CHARGE_TO_THROW
-                    and radius > THROW_RADIUS_MIN and speed > THROW_SPEED_MIN):
-                vx, vy = cx - prev_pos[0], cy - prev_pos[1]
-                n = math.hypot(vx, vy) + 1e-6
-                orbs.append(FX.KiBlast(px, py, vx / n, vy / n, color, speed=26, radius=int(orb_radius)))
-                slot["charge"] = 0.0
-                slot["prev_angle"] = None
-                slot["centroid"] = (cx, cy)
-            elif slot["charge"] > 0:
-                charge_frac = slot["charge"] / MAX_CHARGE
-                FX.draw_charging_lightning(glow, cenpx, cenpy, orb_radius, charge_frac, color, frame_idx)
-                FX.draw_charge_orb(glow, cenpx, cenpy, orb_radius, color, frame_idx)
-                if radius > MIN_LOOP_RADIUS:
-                    aura.emit(px, py, 10, n=2, color=color)
-
+            active.append((i, cx, cy, prev_pos))
             slot["last_pos"] = (cx, cy)
+
+        if not active:
+            orb_state["centroid"] = None
+            orb_state["charge"] = max(0.0, orb_state["charge"] - CHARGE_DECAY)
+        else:
+            # the orb always sits at the midpoint of however many hands are feeding it
+            target_x = sum(a[1] for a in active) / len(active)
+            target_y = sum(a[2] for a in active) / len(active)
+            if orb_state["centroid"] is None:
+                orb_state["centroid"] = (target_x, target_y)
+            else:
+                cx0, cy0 = orb_state["centroid"]
+                cx0 += (target_x - cx0) * CENTROID_EMA
+                cy0 += (target_y - cy0) * CENTROID_EMA
+                orb_state["centroid"] = (cx0, cy0)
+
+            cenx, ceny = orb_state["centroid"]
+            thrown = False
+            any_circling = False
+
+            for i, cx, cy, prev_pos in active:
+                slot = slots[i]
+                dx, dy = cx - cenx, cy - ceny
+                radius = math.hypot(dx, dy)
+                speed = math.hypot(cx - prev_pos[0], cy - prev_pos[1]) if prev_pos else 0.0
+
+                if (not thrown and prev_pos and orb_state["charge"] >= MIN_CHARGE_TO_THROW
+                        and radius > THROW_RADIUS_MIN and speed > THROW_SPEED_MIN):
+                    vx, vy = cx - prev_pos[0], cy - prev_pos[1]
+                    n = math.hypot(vx, vy) + 1e-6
+                    px, py = int(cenx * w), int(ceny * h)
+                    orb_radius = 12 + orb_state["charge"] * 0.55
+                    orbs.append(FX.KiBlast(px, py, vx / n, vy / n, ORB_COLOR, speed=26, radius=int(orb_radius)))
+                    orb_state["charge"] = 0.0
+                    for s in slots:
+                        s["prev_angle"] = None
+                    thrown = True
+                    continue
+
+                if radius > MIN_LOOP_RADIUS:
+                    any_circling = True
+                    angle = math.atan2(dy, dx)
+                    if slot["prev_angle"] is not None:
+                        delta = angle - slot["prev_angle"]
+                        delta = (delta + math.pi) % (2 * math.pi) - math.pi
+                        orb_state["charge"] = min(MAX_CHARGE, orb_state["charge"] + abs(delta) * CHARGE_PER_RADIAN)
+                    slot["prev_angle"] = angle
+                    if not thrown:
+                        aura.emit(int(cx * w), int(cy * h), 10, n=2, color=ORB_COLOR)
+                else:
+                    slot["prev_angle"] = None
+
+            if not any_circling and not thrown:
+                orb_state["charge"] = max(0.0, orb_state["charge"] - CHARGE_DECAY)
+
+            if not thrown and orb_state["charge"] > 0:
+                cenpx, cenpy = int(cenx * w), int(ceny * h)
+                orb_radius = 12 + orb_state["charge"] * 0.55
+                charge_frac = orb_state["charge"] / MAX_CHARGE
+                FX.draw_charging_lightning(glow, cenpx, cenpy, orb_radius, charge_frac, ORB_COLOR, frame_idx)
+                FX.draw_charge_orb(glow, cenpx, cenpy, orb_radius, ORB_COLOR, frame_idx)
 
         aura.update_and_draw(glow)
 
@@ -190,7 +218,7 @@ def main():
         glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=6, sigmaY=6)
         frame = FX.blend_additive(frame, glow)
 
-        cv2.putText(frame, "circle a hand to charge an orb - swing it outward to throw  r=reset  q=quit",
+        cv2.putText(frame, "circle one or both hands to charge the orb - swing outward to throw  r=reset  q=quit",
                     (16, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
         cv2.imshow("Energy Orb", frame)
@@ -200,6 +228,7 @@ def main():
             break
         if key == ord('r'):
             slots = [fresh_slot() for _ in range(MAX_HANDS_TRACKED)]
+            orb_state = fresh_orb_state()
             orbs = []
 
     cap.release()
