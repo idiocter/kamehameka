@@ -89,3 +89,40 @@ def draw_charge_orb(glow, cx, cy, radius, color, pulse_t):
     pulse = 1.0 + 0.15 * math.sin(pulse_t * 0.4)
     draw_soft_glow_circle(glow, (cx, cy), radius * pulse, color, intensity=1.3, rings=6)
     cv2.circle(glow, (int(cx), int(cy)), max(2, int(radius * 0.25)), (255, 255, 255), -1, lineType=cv2.LINE_AA)
+
+
+def draw_lightning_bolt(glow, x1, y1, x2, y2, color, thickness=2, segments=6, jitter=14):
+    """A jagged bolt from (x1, y1) to (x2, y2), rendered as a displaced zigzag."""
+    dx, dy = x2 - x1, y2 - y1
+    n = math.hypot(dx, dy) + 1e-6
+    perp = (-dy / n, dx / n)
+
+    points = [(x1, y1)]
+    for i in range(1, segments):
+        t = i / segments
+        bx = x1 + dx * t
+        by = y1 + dy * t
+        edge_fade = min(t, 1 - t) * 2  # taper jitter toward both ends
+        offset = random.uniform(-jitter, jitter) * edge_fade
+        points.append((bx + perp[0] * offset, by + perp[1] * offset))
+    points.append((x2, y2))
+
+    pts = [(int(px), int(py)) for px, py in points]
+    for a, b in zip(pts, pts[1:]):
+        cv2.line(glow, a, b, color, thickness, lineType=cv2.LINE_AA)
+    for a, b in zip(pts, pts[1:]):
+        cv2.line(glow, a, b, (255, 255, 255), max(1, thickness // 2), lineType=cv2.LINE_AA)
+
+
+def draw_charging_lightning(glow, cx, cy, orb_radius, charge_frac, color, frame_idx):
+    """Lightning arcs crackling inward from surrounding space, feeding a charging orb."""
+    n_arcs = 1 + int(charge_frac * 5)
+    reach = orb_radius * (2.5 + charge_frac * 2.0)
+
+    for i in range(n_arcs):
+        if (frame_idx + i * 7) % 3 != 0:  # flicker - not every arc fires every frame
+            continue
+        ang = random.uniform(0, 2 * math.pi)
+        sx = cx + math.cos(ang) * reach
+        sy = cy + math.sin(ang) * reach
+        draw_lightning_bolt(glow, sx, sy, cx, cy, color, thickness=2, segments=5, jitter=10)

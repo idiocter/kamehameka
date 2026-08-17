@@ -168,6 +168,8 @@ def main():
                 slot["prev_angle"] = None
                 slot["centroid"] = (cx, cy)
             elif slot["charge"] > 0:
+                charge_frac = slot["charge"] / MAX_CHARGE
+                FX.draw_charging_lightning(glow, cenpx, cenpy, orb_radius, charge_frac, color, frame_idx)
                 FX.draw_charge_orb(glow, cenpx, cenpy, orb_radius, color, frame_idx)
                 if radius > MIN_LOOP_RADIUS:
                     aura.emit(px, py, 10, n=2, color=color)
