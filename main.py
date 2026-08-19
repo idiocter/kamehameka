@@ -1,17 +1,25 @@
 """
-Energy Orb: circle your hand(s) to conjure a single glowing ball of ki, then throw it.
+Rasengan & Rasenshuriken: weave the hand seals, then throw the jutsu.
 
-Move a hand in a circular motion in front of the camera - like winding up
-for a Kamehameha - and a glowing orb forms at the center of the circle,
-growing as you keep circling it. Use both hands together, circling in sync
-around the space between them, to charge the very same orb faster - it's
-always a single shared ball no matter how many hands are feeding it, never
-more than one at a time. Once it's charged, swing a hand outward fast to
-throw it; it flies off in the direction of the swing and fades away.
+Perform the six-seal sequence in order - Serpent, Tiger, Horse, Hare, Boar, Ram -
+in front of the camera. The HUD lights up each seal as it registers. Complete the
+sequence and a Rasengan spins into life in your palm and follows your hand.
 
-Press 'r' to clear the orb/charge. Press 'q' or ESC to quit.
+Keep holding it and chakra builds; at full charge the Rasengan tears open into a
+Rasenshuriken, a four-bladed disc of wind. Swing your hand outward fast to throw
+whichever one you are holding - the Rasenshuriken detonates into a dome of wind
+blades when it lands.
+
+Seal recognition matches against templates recorded from your own hands, so it
+needs training first:
+
+    python main.py --train     record the six seals (writes seals.json)
+    python main.py             cast
+
+Press 'r' to drop the jutsu and reset the sequence. Press 'q' or ESC to quit.
 """
 import math
+import sys
 
 import cv2
 import mediapipe as mp
@@ -19,38 +27,47 @@ mp_hands = mp.solutions.hands
 
 import gestures as G
 import effects as FX
+import seals as S
+import train as T
 
 # --- tunables -------------------------------------------------------------
 MAX_HANDS_TRACKED = 2
 MATCH_DIST = 0.18          # normalized distance to keep matching a hand to its tracked slot
 SLOT_TIMEOUT_FRAMES = 20   # frames a slot can go unmatched before its tracking resets
-CENTROID_EMA = 0.03        # how slowly the orb's center follows the circling hand(s)
-MIN_LOOP_RADIUS = 0.045    # normalized distance from center required to count as "circling"
-CHARGE_PER_REV = 18        # charge gained per full revolution, per hand
-CHARGE_PER_RADIAN = CHARGE_PER_REV / (2 * math.pi)
-MAX_CHARGE = 150
-CHARGE_DECAY = 2.5         # charge lost per frame while nothing is circling
-MIN_CHARGE_TO_THROW = 30
-THROW_SPEED_MIN = 0.055    # normalized frame-to-frame speed that counts as a throwing swing
-THROW_RADIUS_MIN = 0.09    # must swing out this far from the orb's center to release it
+ANCHOR_EMA = 0.45          # how tightly the jutsu follows the palm it is riding on
 
-ORB_COLOR = (60, 200, 255)  # BGR - single shared orb, single color
+MAX_CHARGE = 100.0
+CHARGE_PER_FRAME = MAX_CHARGE / 75.0  # ~2.5s at 30fps to reach Rasenshuriken
+CHARGE_DECAY = 2.0         # charge bled off per frame while no hand is visible
+DROP_AFTER_LOST_FRAMES = 45  # jutsu fizzles out if your hands stay gone this long
+
+ARM_FRAMES = 10            # grace period so the last seal's motion can't insta-throw
+THROW_SPEED_MIN = 0.055    # normalized frame-to-frame palm speed that counts as a throw
+
+BASE_RADIUS = 22.0
+RADIUS_PER_CHARGE = 0.10
+
+IDLE, RASENGAN, RASENSHURIKEN = "idle", "rasengan", "rasenshuriken"
+TEXT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def fresh_slot():
     """Per-hand identity tracking (used to match detections frame-to-frame)."""
     return {
         "last_pos": None,
-        "prev_angle": None,
         "missing_frames": 0,
     }
 
 
-def fresh_orb_state():
-    """The single shared orb that all tracked hands feed into."""
+def fresh_jutsu():
+    """The single jutsu being held, if any."""
     return {
-        "centroid": None,
+        "state": IDLE,
+        "pos": None,
         "charge": 0.0,
+        "slot": None,      # which tracked hand it is riding on
+        "age": 0,
+        "lost_frames": 0,
     }
 
 
@@ -82,6 +99,50 @@ def match_hands_to_slots(slots, detections):
     return assigned
 
 
+def jutsu_radius(charge):
+    return BASE_RADIUS + charge * RADIUS_PER_CHARGE
+
+
+def draw_hud(frame, jutsu, tracker, live_match, trained):
+    """Seal sequence across the bottom, jutsu state and live match up top."""
+    h, w = frame.shape[:2]
+
+    if not trained:
+        cv2.putText(frame, "no seal templates - run:  python main.py --train",
+                    (16, 34), TEXT, 0.62, (80, 160, 255), 2, cv2.LINE_AA)
+    elif jutsu["state"] == RASENSHURIKEN:
+        cv2.putText(frame, "RASENSHURIKEN", (16, 34), TEXT, 0.78, (255, 225, 170), 2, cv2.LINE_AA)
+    elif jutsu["state"] == RASENGAN:
+        pct = int(jutsu["charge"] / MAX_CHARGE * 100)
+        cv2.putText(frame, f"RASENGAN  {pct}%", (16, 34), TEXT, 0.78, (255, 170, 70), 2, cv2.LINE_AA)
+        bar_w = int(220 * jutsu["charge"] / MAX_CHARGE)
+        cv2.rectangle(frame, (16, 44), (236, 54), (70, 70, 70), 1)
+        if bar_w > 1:
+            cv2.rectangle(frame, (17, 45), (16 + bar_w, 53), (255, 170, 70), -1)
+    else:
+        cv2.putText(frame, "WEAVE THE SEALS", (16, 34), TEXT, 0.7, (150, 150, 150), 2, cv2.LINE_AA)
+
+    if live_match:
+        cv2.putText(frame, live_match.upper(), (w - 170, 34), TEXT, 0.7, (120, 255, 160), 2, cv2.LINE_AA)
+
+    # The sequence, lit up as far as you've got.
+    if jutsu["state"] == IDLE:
+        x = 16
+        for i, name in enumerate(S.SEQUENCE):
+            done = i < tracker.progress
+            nxt = i == tracker.progress
+            color = (120, 255, 160) if done else ((255, 200, 90) if nxt else (95, 95, 95))
+            label = name.upper()
+            cv2.putText(frame, label, (x, h - 40), TEXT, 0.52, color, 2 if (done or nxt) else 1, cv2.LINE_AA)
+            x += cv2.getTextSize(label, TEXT, 0.52, 2)[0][0] + 10
+            if i < len(S.SEQUENCE) - 1:
+                cv2.putText(frame, ">", (x - 4, h - 40), TEXT, 0.45, (80, 80, 80), 1, cv2.LINE_AA)
+                x += 14
+
+    cv2.putText(frame, "weave the seals to form a Rasengan  -  hold to charge  -  swing to throw   r=reset  q=quit",
+                (16, h - 14), TEXT, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+
+
 def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -95,10 +156,26 @@ def main():
         min_tracking_confidence=0.6,
     )
 
+    if "--train" in sys.argv:
+        T.run_training(cap, hands)
+        cap.release()
+        cv2.destroyAllWindows()
+        hands.close()
+        return
+
+    recognizer = S.SealRecognizer.load()
+    if recognizer is None:
+        print("No seal templates found. Run 'python main.py --train' to record them first.")
+    else:
+        missing = recognizer.missing_seals()
+        if missing:
+            print("Warning: no templates recorded for: " + ", ".join(missing))
+
+    tracker = S.SequenceTracker()
     slots = [fresh_slot() for _ in range(MAX_HANDS_TRACKED)]
-    orb_state = fresh_orb_state()
+    jutsu = fresh_jutsu()
     aura = FX.AuraParticles()
-    orbs = []
+    projectiles = []
 
     frame_idx = 0
     connections = mp_hands.HAND_CONNECTIONS
@@ -127,109 +204,111 @@ def main():
 
         assigned = match_hands_to_slots(slots, detections)
 
-        active = []  # (slot_idx, cx, cy, prev_pos) for every hand seen this frame
+        active = {}  # slot_idx -> (cx, cy, prev_pos) for every hand seen this frame
         for i, slot in enumerate(slots):
             hit = assigned.get(i)
             if hit is None:
                 slot["missing_frames"] += 1
-                slot["prev_angle"] = None
                 if slot["missing_frames"] > SLOT_TIMEOUT_FRAMES:
                     slots[i] = fresh_slot()
                 continue
 
             cx, cy, _lm = hit
-            prev_pos = slot["last_pos"]
+            active[i] = (cx, cy, slot["last_pos"])
             slot["missing_frames"] = 0
-            active.append((i, cx, cy, prev_pos))
             slot["last_pos"] = (cx, cy)
 
-        if not active:
-            orb_state["centroid"] = None
-            orb_state["charge"] = max(0.0, orb_state["charge"] - CHARGE_DECAY)
-        else:
-            # the orb always sits at the midpoint of however many hands are feeding it
-            target_x = sum(a[1] for a in active) / len(active)
-            target_y = sum(a[2] for a in active) / len(active)
-            if orb_state["centroid"] is None:
-                orb_state["centroid"] = (target_x, target_y)
+        # --- seal weaving (only while empty-handed) ---------------------
+        live_match = None
+        if jutsu["state"] == IDLE and recognizer is not None:
+            vector, n_hands = S.feature_from_result(result)
+            stable, live_match, _dist = recognizer.update(vector, n_hands)
+            if tracker.feed(stable):
+                anchor = next(iter(active), None)
+                pos = active[anchor][:2] if anchor is not None else (0.5, 0.5)
+                jutsu.update({"state": RASENGAN, "pos": pos, "charge": 0.0,
+                              "slot": anchor, "age": 0, "lost_frames": 0})
+                recognizer.reset()
+
+        # --- holding a jutsu -------------------------------------------
+        elif jutsu["state"] != IDLE:
+            jutsu["age"] += 1
+
+            # Stay on the hand it was formed in; fall back to any live hand.
+            hand = active.get(jutsu["slot"])
+            if hand is None and active:
+                jutsu["slot"] = next(iter(active))
+                hand = active[jutsu["slot"]]
+
+            if hand is None:
+                jutsu["lost_frames"] += 1
+                jutsu["charge"] = max(0.0, jutsu["charge"] - CHARGE_DECAY)
+                if jutsu["lost_frames"] > DROP_AFTER_LOST_FRAMES:
+                    jutsu = fresh_jutsu()
+                    tracker.reset()
             else:
-                cx0, cy0 = orb_state["centroid"]
-                cx0 += (target_x - cx0) * CENTROID_EMA
-                cy0 += (target_y - cy0) * CENTROID_EMA
-                orb_state["centroid"] = (cx0, cy0)
+                cx, cy, prev_pos = hand
+                jutsu["lost_frames"] = 0
 
-            cenx, ceny = orb_state["centroid"]
-            thrown = False
-            any_circling = False
+                px, py = jutsu["pos"]
+                jutsu["pos"] = (px + (cx - px) * ANCHOR_EMA, py + (cy - py) * ANCHOR_EMA)
 
-            for i, cx, cy, prev_pos in active:
-                slot = slots[i]
-                dx, dy = cx - cenx, cy - ceny
-                radius = math.hypot(dx, dy)
                 speed = math.hypot(cx - prev_pos[0], cy - prev_pos[1]) if prev_pos else 0.0
-
-                if (not thrown and prev_pos and orb_state["charge"] >= MIN_CHARGE_TO_THROW
-                        and radius > THROW_RADIUS_MIN and speed > THROW_SPEED_MIN):
+                if jutsu["age"] > ARM_FRAMES and speed > THROW_SPEED_MIN and prev_pos:
                     vx, vy = cx - prev_pos[0], cy - prev_pos[1]
                     n = math.hypot(vx, vy) + 1e-6
-                    px, py = int(cenx * w), int(ceny * h)
-                    orb_radius = 12 + orb_state["charge"] * 0.55
-                    orbs.append(FX.KiBlast(px, py, vx / n, vy / n, ORB_COLOR, speed=26, radius=int(orb_radius)))
-                    orb_state["charge"] = 0.0
-                    for s in slots:
-                        s["prev_angle"] = None
-                    thrown = True
-                    continue
-
-                if radius > MIN_LOOP_RADIUS:
-                    any_circling = True
-                    angle = math.atan2(dy, dx)
-                    if slot["prev_angle"] is not None:
-                        delta = angle - slot["prev_angle"]
-                        delta = (delta + math.pi) % (2 * math.pi) - math.pi
-                        orb_state["charge"] = min(MAX_CHARGE, orb_state["charge"] + abs(delta) * CHARGE_PER_RADIAN)
-                    slot["prev_angle"] = angle
-                    if not thrown:
-                        aura.emit(int(cx * w), int(cy * h), 10, n=2, color=ORB_COLOR)
+                    ox, oy = jutsu["pos"]
+                    projectiles.append(FX.JutsuBlast(
+                        int(ox * w), int(oy * h), vx / n, vy / n, jutsu["state"],
+                        speed=28, radius=int(jutsu_radius(jutsu["charge"]))))
+                    jutsu = fresh_jutsu()
+                    tracker.reset()
                 else:
-                    slot["prev_angle"] = None
+                    if jutsu["state"] == RASENGAN:
+                        jutsu["charge"] = min(MAX_CHARGE, jutsu["charge"] + CHARGE_PER_FRAME)
+                        if jutsu["charge"] >= MAX_CHARGE:
+                            jutsu["state"] = RASENSHURIKEN
+                    aura.emit(int(cx * w), int(cy * h), 14, n=2, color=FX.RASENGAN_COLOR)
 
-            if not any_circling and not thrown:
-                orb_state["charge"] = max(0.0, orb_state["charge"] - CHARGE_DECAY)
-
-            if not thrown and orb_state["charge"] > 0:
-                cenpx, cenpy = int(cenx * w), int(ceny * h)
-                orb_radius = 12 + orb_state["charge"] * 0.55
-                charge_frac = orb_state["charge"] / MAX_CHARGE
-                FX.draw_charging_lightning(glow, cenpx, cenpy, orb_radius, charge_frac, ORB_COLOR, frame_idx)
-                FX.draw_charge_orb(glow, cenpx, cenpy, orb_radius, ORB_COLOR, frame_idx)
+        if jutsu["state"] != IDLE and jutsu["pos"] is not None:
+            ox, oy = int(jutsu["pos"][0] * w), int(jutsu["pos"][1] * h)
+            radius = jutsu_radius(jutsu["charge"])
+            if jutsu["state"] == RASENSHURIKEN:
+                FX.draw_rasenshuriken(glow, ox, oy, radius, frame_idx)
+            else:
+                FX.draw_rasengan(glow, ox, oy, radius, frame_idx,
+                                 charge_frac=jutsu["charge"] / MAX_CHARGE)
 
         aura.update_and_draw(glow)
 
-        next_orbs = []
-        for orb in orbs:
-            orb.update()
-            if orb.offscreen(w, h):
+        next_projectiles = []
+        for p in projectiles:
+            p.update()
+            if p.offscreen(w, h):
+                if getattr(p, "detonates", False) and p.life <= 0:
+                    next_projectiles.append(FX.WindDome(p.x, p.y))
                 continue
-            orb.draw(glow)
-            next_orbs.append(orb)
-        orbs = next_orbs
+            p.draw(glow)
+            next_projectiles.append(p)
+        projectiles = next_projectiles
 
         glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=6, sigmaY=6)
         frame = FX.blend_additive(frame, glow)
 
-        cv2.putText(frame, "circle one or both hands to charge the orb - swing outward to throw  r=reset  q=quit",
-                    (16, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+        draw_hud(frame, jutsu, tracker, live_match, recognizer is not None)
 
-        cv2.imshow("Energy Orb", frame)
+        cv2.imshow("Rasengan", frame)
         frame_idx += 1
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
             break
         if key == ord('r'):
             slots = [fresh_slot() for _ in range(MAX_HANDS_TRACKED)]
-            orb_state = fresh_orb_state()
-            orbs = []
+            jutsu = fresh_jutsu()
+            projectiles = []
+            tracker.reset()
+            if recognizer is not None:
+                recognizer.reset()
 
     cap.release()
     cv2.destroyAllWindows()
