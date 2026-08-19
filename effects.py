@@ -1,8 +1,16 @@
-"""DBZ-style visual effects rendered with OpenCV, additive-blended onto frames."""
+"""Jutsu visual effects rendered with OpenCV, additive-blended onto frames.
+
+Everything draws onto a float32 BGR "glow" layer which the caller blurs and adds
+back over the camera frame, so overlapping effects accumulate into light rather
+than painting over each other.
+"""
 import random
 import math
 import numpy as np
 import cv2
+
+RASENGAN_COLOR = (255, 170, 70)        # BGR - chakra blue
+RASENSHURIKEN_COLOR = (255, 225, 170)  # BGR - paler, colder blue-white
 
 
 def _glow_layer(shape):
@@ -15,8 +23,22 @@ def blend_additive(frame, glow):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _scale(color, k):
+    return tuple(min(255.0, float(ch) * k) for ch in color)
+
+
+def draw_soft_glow_circle(glow, center, radius, color, intensity=1.0, rings=4):
+    """Simulate a soft glow by drawing several alpha-decreasing rings."""
+    cx, cy = int(center[0]), int(center[1])
+    for i in range(rings, 0, -1):
+        r = int(radius * i / rings)
+        alpha = intensity * (1 - i / (rings + 1)) * 0.9
+        c = tuple(int(ch * alpha) for ch in color)
+        cv2.circle(glow, (cx, cy), max(1, r), c, -1, lineType=cv2.LINE_AA)
+
+
 class AuraParticles:
-    """Rising spark particles around a point, used while an orb is charging."""
+    """Rising spark particles around a point, used while a jutsu is charging."""
 
     def __init__(self):
         self.particles = []  # each: [x, y, vx, vy, life, max_life, color]
@@ -48,81 +70,126 @@ class AuraParticles:
         self.particles = alive
 
 
-def draw_soft_glow_circle(glow, center, radius, color, intensity=1.0, rings=4):
-    """Simulate a soft glow by drawing several alpha-decreasing rings."""
-    cx, cy = int(center[0]), int(center[1])
-    for i in range(rings, 0, -1):
-        r = int(radius * i / rings)
-        alpha = intensity * (1 - i / (rings + 1)) * 0.9
-        c = tuple(int(ch * alpha) for ch in color)
-        cv2.circle(glow, (cx, cy), max(1, r), c, -1, lineType=cv2.LINE_AA)
+def draw_rasengan(glow, cx, cy, radius, frame_idx, charge_frac=1.0, color=RASENGAN_COLOR):
+    """A dense sphere of chakra with shell layers spiralling around a white core."""
+    cx, cy = int(cx), int(cy)
+    pulse = 1.0 + 0.06 * math.sin(frame_idx * 0.45)
+    r = max(4.0, radius * pulse)
+    brightness = 0.7 + 0.5 * charge_frac
+
+    draw_soft_glow_circle(glow, (cx, cy), r * 1.3, color, intensity=1.1 * brightness, rings=6)
+
+    # Rotating shell arcs at differing radii and speeds read as a spiral swirl.
+    for i in range(3):
+        rr = max(2, int(r * (0.55 + 0.2 * i)))
+        tilt = (frame_idx * (9.0 + 4.0 * i) + i * 55) % 360
+        sweep_start = (frame_idx * (13.0 - 3.0 * i)) % 360
+        cv2.ellipse(glow, (cx, cy), (rr, max(2, int(rr * 0.62))), tilt,
+                    sweep_start, sweep_start + 250, _scale(color, 1.15 * brightness),
+                    max(1, int(r * 0.09)), lineType=cv2.LINE_AA)
+
+    # Wisps skimming the surface.
+    for i in range(4):
+        a = frame_idx * 0.32 + i * (math.pi / 2)
+        wx = cx + math.cos(a) * r * 1.05
+        wy = cy + math.sin(a) * r * 0.75
+        cv2.circle(glow, (int(wx), int(wy)), max(1, int(r * 0.1)),
+                   _scale(color, 1.3 * brightness), -1, lineType=cv2.LINE_AA)
+
+    cv2.circle(glow, (cx, cy), max(2, int(r * 0.34)),
+               _scale((255, 255, 255), brightness), -1, lineType=cv2.LINE_AA)
 
 
-class KiBlast:
-    """A projectile energy orb fired from the palm in a direction."""
+def draw_rasenshuriken(glow, cx, cy, radius, frame_idx, color=RASENSHURIKEN_COLOR):
+    """The Rasengan core wrapped in a fast-spinning four-bladed wind disc."""
+    cx, cy = int(cx), int(cy)
+    spin = frame_idx * 0.34
+    blade_len = radius * 2.6
+    inner = radius * 0.85
 
-    def __init__(self, x, y, dx, dy, color, speed=22, radius=16, owner=None):
+    for k in range(4):
+        a = spin + k * (math.pi / 2)
+        # Swept-back petal: the leading edge reaches further than the trailing edge.
+        pts = [
+            (cx + math.cos(a - 0.42) * inner, cy + math.sin(a - 0.42) * inner),
+            (cx + math.cos(a - 0.12) * blade_len, cy + math.sin(a - 0.12) * blade_len),
+            (cx + math.cos(a + 0.05) * blade_len * 0.92, cy + math.sin(a + 0.05) * blade_len * 0.92),
+            (cx + math.cos(a + 0.42) * inner, cy + math.sin(a + 0.42) * inner),
+        ]
+        poly = np.array([[int(px), int(py)] for px, py in pts], dtype=np.int32)
+        cv2.fillConvexPoly(glow, poly, _scale(color, 0.42), lineType=cv2.LINE_AA)
+        cv2.polylines(glow, [poly], True, _scale(color, 1.0), 1, lineType=cv2.LINE_AA)
+
+    # Thin outer ring sells the motion blur of the disc.
+    cv2.circle(glow, (cx, cy), max(2, int(blade_len * 0.98)), _scale(color, 0.28), 1, lineType=cv2.LINE_AA)
+
+    draw_rasengan(glow, cx, cy, radius, frame_idx, charge_frac=1.0, color=color)
+
+
+class JutsuBlast:
+    """A thrown Rasengan or Rasenshuriken travelling in a straight line."""
+
+    def __init__(self, x, y, dx, dy, style, speed=28, radius=26):
         self.x, self.y = x, y
         self.dx, self.dy = dx, dy
-        self.color = color
+        self.style = style
         self.speed = speed
         self.radius = radius
-        self.life = 60
-        self.owner = owner
+        self.frame = 0
+        self.detonates = style == "rasenshuriken"
+        # The Rasenshuriken gets a short fuse so it goes off inside the frame
+        # instead of sailing offscreen; a plain Rasengan just flies away.
+        self.life = 16 if self.detonates else 60
 
     def update(self):
         self.x += self.dx * self.speed
         self.y += self.dy * self.speed
         self.life -= 1
+        self.frame += 1
 
     def offscreen(self, w, h):
         return self.life <= 0 or self.x < -50 or self.x > w + 50 or self.y < -50 or self.y > h + 50
 
     def draw(self, glow):
-        draw_soft_glow_circle(glow, (self.x, self.y), self.radius, self.color, intensity=1.2, rings=5)
-        core = tuple(min(255, int(c * 1.5)) for c in self.color)
-        cv2.circle(glow, (int(self.x), int(self.y)), max(2, self.radius // 3), core, -1, lineType=cv2.LINE_AA)
+        if self.style == "rasenshuriken":
+            draw_rasenshuriken(glow, self.x, self.y, self.radius, self.frame * 3)
+        else:
+            draw_rasengan(glow, self.x, self.y, self.radius, self.frame * 3)
 
 
-def draw_charge_orb(glow, cx, cy, radius, color, pulse_t):
-    """Pulsing glowing orb used while an energy ball is forming."""
-    pulse = 1.0 + 0.15 * math.sin(pulse_t * 0.4)
-    draw_soft_glow_circle(glow, (cx, cy), radius * pulse, color, intensity=1.3, rings=6)
-    cv2.circle(glow, (int(cx), int(cy)), max(2, int(radius * 0.25)), (255, 255, 255), -1, lineType=cv2.LINE_AA)
+class WindDome:
+    """Rasenshuriken detonation - an expanding shell of wind blades tearing outward."""
 
+    def __init__(self, x, y, max_radius=260, life=28, color=RASENSHURIKEN_COLOR):
+        self.x, self.y = int(x), int(y)
+        self.max_radius = max_radius
+        self.life = life
+        self.max_life = life
+        self.color = color
+        self.needles = [(random.uniform(0, 2 * math.pi), random.uniform(0.7, 1.15)) for _ in range(26)]
 
-def draw_lightning_bolt(glow, x1, y1, x2, y2, color, thickness=2, segments=6, jitter=14):
-    """A jagged bolt from (x1, y1) to (x2, y2), rendered as a displaced zigzag."""
-    dx, dy = x2 - x1, y2 - y1
-    n = math.hypot(dx, dy) + 1e-6
-    perp = (-dy / n, dx / n)
+    def update(self):
+        self.life -= 1
 
-    points = [(x1, y1)]
-    for i in range(1, segments):
-        t = i / segments
-        bx = x1 + dx * t
-        by = y1 + dy * t
-        edge_fade = min(t, 1 - t) * 2  # taper jitter toward both ends
-        offset = random.uniform(-jitter, jitter) * edge_fade
-        points.append((bx + perp[0] * offset, by + perp[1] * offset))
-    points.append((x2, y2))
+    def offscreen(self, w, h):
+        return self.life <= 0
 
-    pts = [(int(px), int(py)) for px, py in points]
-    for a, b in zip(pts, pts[1:]):
-        cv2.line(glow, a, b, color, thickness, lineType=cv2.LINE_AA)
-    for a, b in zip(pts, pts[1:]):
-        cv2.line(glow, a, b, (255, 255, 255), max(1, thickness // 2), lineType=cv2.LINE_AA)
+    def draw(self, glow):
+        t = 1.0 - self.life / self.max_life           # 0 -> 1 over the blast
+        radius = self.max_radius * (1 - (1 - t) ** 2)  # bursts out fast, then eases
+        fade = (self.life / self.max_life) ** 1.5
 
+        cv2.circle(glow, (self.x, self.y), max(2, int(radius)), _scale(self.color, fade),
+                   max(1, int(6 * fade)), lineType=cv2.LINE_AA)
+        cv2.circle(glow, (self.x, self.y), max(1, int(radius * 0.72)), _scale(self.color, fade * 0.45),
+                   max(1, int(3 * fade)), lineType=cv2.LINE_AA)
 
-def draw_charging_lightning(glow, cx, cy, orb_radius, charge_frac, color, frame_idx):
-    """Lightning arcs crackling inward from surrounding space, feeding a charging orb."""
-    n_arcs = 1 + int(charge_frac * 5)
-    reach = orb_radius * (2.5 + charge_frac * 2.0)
+        for ang, span in self.needles:
+            r0 = radius * 0.55 * span
+            r1 = radius * 1.08 * span
+            cv2.line(glow,
+                     (int(self.x + math.cos(ang) * r0), int(self.y + math.sin(ang) * r0)),
+                     (int(self.x + math.cos(ang) * r1), int(self.y + math.sin(ang) * r1)),
+                     _scale(self.color, fade * 0.9), max(1, int(2 * fade)), lineType=cv2.LINE_AA)
 
-    for i in range(n_arcs):
-        if (frame_idx + i * 7) % 3 != 0:  # flicker - not every arc fires every frame
-            continue
-        ang = random.uniform(0, 2 * math.pi)
-        sx = cx + math.cos(ang) * reach
-        sy = cy + math.sin(ang) * reach
-        draw_lightning_bolt(glow, sx, sy, cx, cy, color, thickness=2, segments=5, jitter=10)
+        draw_soft_glow_circle(glow, (self.x, self.y), radius * 0.4, self.color, intensity=fade * 1.2, rings=4)
