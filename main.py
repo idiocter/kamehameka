@@ -5,10 +5,11 @@ Perform the six-seal sequence in order - Serpent, Tiger, Horse, Hare, Boar, Ram 
 in front of the camera. The HUD lights up each seal as it registers. Complete the
 sequence and a Rasengan spins into life in your palm and follows your hand.
 
-Keep holding it and chakra builds; at full charge the Rasengan tears open into a
-Rasenshuriken, a four-bladed disc of wind. Swing your hand outward fast to throw
-whichever one you are holding - the Rasenshuriken detonates into a dome of wind
-blades when it lands.
+Keep holding it and chakra builds. Once the charge bar fills, squeeze your hand
+shut and the blue Rasengan tears open into a white four-bladed Rasenshuriken -
+it stays one from then on, so you can open your hand again to throw it. Swing
+outward fast to throw whichever you are holding; the Rasenshuriken detonates
+into a dome of wind blades when it lands.
 
 Seal recognition matches against templates recorded from your own hands, so it
 needs training first:
@@ -44,6 +45,9 @@ DROP_AFTER_LOST_FRAMES = 45  # jutsu fizzles out if your hands stay gone this lo
 ARM_FRAMES = 10            # grace period so the last seal's motion can't insta-throw
 THROW_SPEED_MIN = 0.055    # normalized frame-to-frame palm speed that counts as a throw
 
+SQUEEZE_RATIO = 1.55       # grip_ratio below this counts as squeezing (a light curl)
+SQUEEZE_HOLD_FRAMES = 4    # debounce, so one noisy frame can't convert the jutsu
+
 BASE_RADIUS = 22.0
 RADIUS_PER_CHARGE = 0.10
 
@@ -68,6 +72,7 @@ def fresh_jutsu():
         "slot": None,      # which tracked hand it is riding on
         "age": 0,
         "lost_frames": 0,
+        "squeeze_frames": 0,
     }
 
 
@@ -103,7 +108,7 @@ def jutsu_radius(charge):
     return BASE_RADIUS + charge * RADIUS_PER_CHARGE
 
 
-def draw_hud(frame, jutsu, tracker, live_match, trained):
+def draw_hud(frame, jutsu, tracker, live_match, trained, grip=None, frame_idx=0):
     """Seal sequence across the bottom, jutsu state and live match up top."""
     h, w = frame.shape[:2]
 
@@ -111,16 +116,31 @@ def draw_hud(frame, jutsu, tracker, live_match, trained):
         cv2.putText(frame, "no seal templates - run:  python main.py --train",
                     (16, 34), TEXT, 0.62, (80, 160, 255), 2, cv2.LINE_AA)
     elif jutsu["state"] == RASENSHURIKEN:
-        cv2.putText(frame, "RASENSHURIKEN", (16, 34), TEXT, 0.78, (255, 225, 170), 2, cv2.LINE_AA)
+        cv2.putText(frame, "RASENSHURIKEN", (16, 34), TEXT, 0.78, (255, 250, 245), 2, cv2.LINE_AA)
     elif jutsu["state"] == RASENGAN:
+        charged = jutsu["charge"] >= MAX_CHARGE
         pct = int(jutsu["charge"] / MAX_CHARGE * 100)
-        cv2.putText(frame, f"RASENGAN  {pct}%", (16, 34), TEXT, 0.78, (255, 170, 70), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"RASENGAN  {pct}%", (16, 34), TEXT, 0.78, (255, 150, 60), 2, cv2.LINE_AA)
         bar_w = int(220 * jutsu["charge"] / MAX_CHARGE)
         cv2.rectangle(frame, (16, 44), (236, 54), (70, 70, 70), 1)
         if bar_w > 1:
-            cv2.rectangle(frame, (17, 45), (16 + bar_w, 53), (255, 170, 70), -1)
+            cv2.rectangle(frame, (17, 45), (16 + bar_w, 53), (255, 150, 60), -1)
+        if charged:
+            # Squeezing before this point does nothing on purpose, so say clearly
+            # when it starts working - otherwise it just reads as broken.
+            flash = 255 if (frame_idx // 8) % 2 == 0 else 140
+            cv2.putText(frame, "SQUEEZE YOUR HAND", (16, 80), TEXT, 0.72,
+                        (flash, flash, flash), 2, cv2.LINE_AA)
+
     else:
         cv2.putText(frame, "WEAVE THE SEALS", (16, 34), TEXT, 0.7, (150, 150, 150), 2, cv2.LINE_AA)
+
+    # Live grip reading - this is the number to quote if the squeeze threshold
+    # needs adjusting for your hand.
+    if grip is not None:
+        squeezing = grip < SQUEEZE_RATIO
+        cv2.putText(frame, f"grip {grip:0.2f} / {SQUEEZE_RATIO:0.2f}", (16, h - 62), TEXT, 0.45,
+                    (120, 255, 160) if squeezing else (140, 140, 140), 1, cv2.LINE_AA)
 
     if live_match:
         cv2.putText(frame, live_match.upper(), (w - 170, 34), TEXT, 0.7, (120, 255, 160), 2, cv2.LINE_AA)
@@ -139,7 +159,7 @@ def draw_hud(frame, jutsu, tracker, live_match, trained):
                 cv2.putText(frame, ">", (x - 4, h - 40), TEXT, 0.45, (80, 80, 80), 1, cv2.LINE_AA)
                 x += 14
 
-    cv2.putText(frame, "weave the seals to form a Rasengan  -  hold to charge  -  swing to throw   r=reset  q=quit",
+    cv2.putText(frame, "weave the seals  -  hold to charge  -  squeeze for Rasenshuriken  -  swing to throw   r=reset  q=quit",
                 (16, h - 14), TEXT, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
 
@@ -190,7 +210,7 @@ def main():
         rgb.flags.writeable = False
         result = hands.process(rgb)
 
-        glow = FX._glow_layer(frame.shape)
+        layers = FX.GlowLayers(frame.shape)
 
         raw_hands = result.multi_hand_landmarks if result.multi_hand_landmarks else []
         detections = [(*G.palm_center(hlm.landmark), hlm.landmark) for hlm in raw_hands]
@@ -204,7 +224,7 @@ def main():
 
         assigned = match_hands_to_slots(slots, detections)
 
-        active = {}  # slot_idx -> (cx, cy, prev_pos) for every hand seen this frame
+        active = {}  # slot_idx -> (cx, cy, prev_pos, lm) for every hand seen this frame
         for i, slot in enumerate(slots):
             hit = assigned.get(i)
             if hit is None:
@@ -213,13 +233,14 @@ def main():
                     slots[i] = fresh_slot()
                 continue
 
-            cx, cy, _lm = hit
-            active[i] = (cx, cy, slot["last_pos"])
+            cx, cy, lm = hit
+            active[i] = (cx, cy, slot["last_pos"], lm)
             slot["missing_frames"] = 0
             slot["last_pos"] = (cx, cy)
 
         # --- seal weaving (only while empty-handed) ---------------------
         live_match = None
+        grip = None
         if jutsu["state"] == IDLE and recognizer is not None:
             vector, n_hands = S.feature_from_result(result)
             stable, live_match, _dist = recognizer.update(vector, n_hands)
@@ -227,7 +248,8 @@ def main():
                 anchor = next(iter(active), None)
                 pos = active[anchor][:2] if anchor is not None else (0.5, 0.5)
                 jutsu.update({"state": RASENGAN, "pos": pos, "charge": 0.0,
-                              "slot": anchor, "age": 0, "lost_frames": 0})
+                              "slot": anchor, "age": 0, "lost_frames": 0,
+                              "squeeze_frames": 0})
                 recognizer.reset()
 
         # --- holding a jutsu -------------------------------------------
@@ -247,8 +269,9 @@ def main():
                     jutsu = fresh_jutsu()
                     tracker.reset()
             else:
-                cx, cy, prev_pos = hand
+                cx, cy, prev_pos, lm = hand
                 jutsu["lost_frames"] = 0
+                grip = G.grip_ratio(lm)
 
                 px, py = jutsu["pos"]
                 jutsu["pos"] = (px + (cx - px) * ANCHOR_EMA, py + (cy - py) * ANCHOR_EMA)
@@ -266,20 +289,28 @@ def main():
                 else:
                     if jutsu["state"] == RASENGAN:
                         jutsu["charge"] = min(MAX_CHARGE, jutsu["charge"] + CHARGE_PER_FRAME)
-                        if jutsu["charge"] >= MAX_CHARGE:
-                            jutsu["state"] = RASENSHURIKEN
-                    aura.emit(int(cx * w), int(cy * h), 14, n=2, color=FX.RASENGAN_COLOR)
+                        # Squeeze converts it, but only once it's fully charged.
+                        # It latches: opening your hand afterwards keeps the
+                        # Rasenshuriken so you can open up to throw it.
+                        if jutsu["charge"] >= MAX_CHARGE and grip is not None and grip < SQUEEZE_RATIO:
+                            jutsu["squeeze_frames"] += 1
+                            if jutsu["squeeze_frames"] >= SQUEEZE_HOLD_FRAMES:
+                                jutsu["state"] = RASENSHURIKEN
+                        else:
+                            jutsu["squeeze_frames"] = 0
+                    color = FX.RASENSHURIKEN_COLOR if jutsu["state"] == RASENSHURIKEN else FX.RASENGAN_COLOR
+                    aura.emit(int(cx * w), int(cy * h), 14, n=2, color=color)
 
         if jutsu["state"] != IDLE and jutsu["pos"] is not None:
             ox, oy = int(jutsu["pos"][0] * w), int(jutsu["pos"][1] * h)
             radius = jutsu_radius(jutsu["charge"])
             if jutsu["state"] == RASENSHURIKEN:
-                FX.draw_rasenshuriken(glow, ox, oy, radius, frame_idx)
+                FX.draw_rasenshuriken(layers, ox, oy, radius, frame_idx)
             else:
-                FX.draw_rasengan(glow, ox, oy, radius, frame_idx,
+                FX.draw_rasengan(layers, ox, oy, radius, frame_idx,
                                  charge_frac=jutsu["charge"] / MAX_CHARGE)
 
-        aura.update_and_draw(glow)
+        aura.update_and_draw(layers)
 
         next_projectiles = []
         for p in projectiles:
@@ -288,14 +319,13 @@ def main():
                 if getattr(p, "detonates", False) and p.life <= 0:
                     next_projectiles.append(FX.WindDome(p.x, p.y))
                 continue
-            p.draw(glow)
+            p.draw(layers)
             next_projectiles.append(p)
         projectiles = next_projectiles
 
-        glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=6, sigmaY=6)
-        frame = FX.blend_additive(frame, glow)
+        frame = layers.composite(frame)
 
-        draw_hud(frame, jutsu, tracker, live_match, recognizer is not None)
+        draw_hud(frame, jutsu, tracker, live_match, recognizer is not None, grip, frame_idx)
 
         cv2.imshow("Rasengan", frame)
         frame_idx += 1
