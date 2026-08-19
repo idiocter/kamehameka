@@ -13,6 +13,7 @@ import cv2
 
 RASENGAN_COLOR = (255, 130, 40)        # BGR - saturated chakra blue
 RASENSHURIKEN_COLOR = (255, 250, 245)  # BGR - white, with only a whisper of blue
+RASENSHURIKEN_HALO = (255, 165, 85)    # BGR - blue, for bloom and rim light only
 
 SOFT_SIGMA = 6.0    # bloom blur
 SHARP_SIGMA = 1.2   # just enough to take the aliasing off an edge
@@ -130,43 +131,89 @@ def draw_rasengan(layers, cx, cy, radius, frame_idx, charge_frac=1.0, color=RASE
     cv2.circle(layers.sharp, (cx, cy), max(2, int(r * 0.22)), core, -1, lineType=cv2.LINE_AA)
 
 
-def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, color=RASENSHURIKEN_COLOR):
+BLADE_SWEEP = -0.40   # radians the centreline curls back over the blade's length
+# Peak half-width as a fraction of blade length. Roughly half the angular space
+# has to stay empty or the four petals merge into a flower and the gaps - which
+# are what make it read as a shuriken - disappear.
+BLADE_WIDTH = 0.17
+_WIDTH_FRONT = 0.45   # exponents of the width profile: t**FRONT * (1-t)**BACK
+_WIDTH_BACK = 1.0     # higher = finer point at the tip
+# Peak of t**a * (1-t)**b sits at t = a/(a+b); divide through by its value there
+# so BLADE_WIDTH means what it says.
+_WIDTH_PEAK_T = _WIDTH_FRONT / (_WIDTH_FRONT + _WIDTH_BACK)
+_WIDTH_NORM = _WIDTH_PEAK_T ** _WIDTH_FRONT * (1 - _WIDTH_PEAK_T) ** _WIDTH_BACK
+
+
+def _blade_spine(cx, cy, angle, inner, outer, samples):
+    """Sample the blade's curved centreline: (x, y, tangential unit vector, width)."""
+    span = outer - inner
+    out = []
+    for i in range(samples + 1):
+        t = i / samples
+        r = inner + span * t
+        th = angle + BLADE_SWEEP * t   # the curl - a straight blade reads as a plus sign
+        w = BLADE_WIDTH * outer * (t ** _WIDTH_FRONT) * ((1 - t) ** _WIDTH_BACK) / _WIDTH_NORM
+        out.append((cx + math.cos(th) * r, cy + math.sin(th) * r, -math.sin(th), math.cos(th), w))
+    return out
+
+
+def _blade_polygon(spine, scale=1.0):
+    """Outline of one petal: out along one edge of the spine, back along the other."""
+    left = [(x + tx * w * scale, y + ty * w * scale) for x, y, tx, ty, w in spine]
+    right = [(x - tx * w * scale, y - ty * w * scale) for x, y, tx, ty, w in spine]
+    pts = left + right[::-1]
+    return np.array([[int(px), int(py)] for px, py in pts], dtype=np.int32)
+
+
+def _blade_striation(spine, offset):
+    """A line running the length of the blade, `offset` across its half-width."""
+    pts = [(x + tx * w * offset, y + ty * w * offset) for x, y, tx, ty, w in spine]
+    return np.array([[int(px), int(py)] for px, py in pts], dtype=np.int32)
+
+
+def draw_rasenshuriken(layers, cx, cy, radius, frame_idx,
+                       color=RASENSHURIKEN_COLOR, halo=RASENSHURIKEN_HALO):
     """The Rasengan core wrapped in a spinning four-bladed wind shuriken.
 
-    The blades go on the sharp layer: at bloom-blur strength the notches between
-    them wash out and the whole thing reads as a disc instead of a star.
+    Each blade is traced along a swept centreline rather than built from corners:
+    it pinches at the hub, bellies out early, then tapers to a curled point. Four
+    straight-sided slivers give you the right symmetry but read as a throwing-star
+    pictogram; the curl and the belly are what make it look like compressed wind.
+
+    Blades go on the sharp layer - at bloom-blur strength the notches between them
+    wash out and the whole thing reads as a disc instead of a star.
     """
     cx, cy = int(cx), int(cy)
     # ~5 deg/frame. A 4-blade star repeats every 90 deg, so this is one visual
     # cycle every ~18 frames - fast enough to feel like a spin, slow enough to
     # actually see the shape.
     spin = frame_idx * 0.09
-    blade_len = radius * 3.4
-    inner = radius * 0.8
+    blade_len = radius * 4.5
+    inner = radius * 0.55
 
     for k in range(4):
-        a = spin + k * (math.pi / 2)
-        # Wide at the hub, tapering to a narrow tip that is swept backwards off
-        # the blade's axis - that sweep is what makes it read as a spinning
-        # shuriken instead of a plus sign. Angles have to shrink faster than the
-        # radius grows, or the blade flares outward into a paddle.
-        pts = [
-            (cx + math.cos(a - 0.62) * inner, cy + math.sin(a - 0.62) * inner),
-            (cx + math.cos(a - 0.265) * blade_len, cy + math.sin(a - 0.265) * blade_len),
-            (cx + math.cos(a - 0.175) * blade_len * 0.99, cy + math.sin(a - 0.175) * blade_len * 0.99),
-            (cx + math.cos(a + 0.62) * inner, cy + math.sin(a + 0.62) * inner),
-        ]
-        poly = np.array([[int(px), int(py)] for px, py in pts], dtype=np.int32)
-        # Lighter fill under a bright rim reads as an edge of wind rather than
-        # a solid white slab.
-        cv2.fillConvexPoly(layers.sharp, poly, _scale(color, 0.50), lineType=cv2.LINE_AA)
-        cv2.polylines(layers.sharp, [poly], True, _scale(color, 1.0), 2, lineType=cv2.LINE_AA)
-        # Faint bloom under each blade so the star still glows without smearing.
-        cv2.fillConvexPoly(layers.soft, poly, _scale(color, 0.25), lineType=cv2.LINE_AA)
+        spine = _blade_spine(cx, cy, spin + k * (math.pi / 2), inner, blade_len, samples=16)
+        poly = _blade_polygon(spine)
 
-    # Thin outer ring sells the motion blur of the disc.
+        # Blue bloom hugs the blade's edge rather than flooding its interior -
+        # a filled blue underlay would tint the whole body and lose the white.
+        cv2.polylines(layers.soft, [_blade_polygon(spine, scale=1.2)], True,
+                      _scale(halo, 0.6), 7, lineType=cv2.LINE_AA)
+
+        # Translucent body inside a crisp rim - cel-shaded, not a solid slab.
+        # fillPoly, not fillConvexPoly: a curved petal is not convex.
+        cv2.fillPoly(layers.sharp, [poly], _scale(color, 0.52), lineType=cv2.LINE_AA)
+
+        for offset in (-0.55, 0.0, 0.55):
+            cv2.polylines(layers.sharp, [_blade_striation(spine, offset)], False,
+                          _scale(color, 0.62), 1, lineType=cv2.LINE_AA)
+
+        cv2.polylines(layers.sharp, [poly], True, _scale(color, 1.0), 2, lineType=cv2.LINE_AA)
+        cv2.polylines(layers.soft, [poly], True, _scale(halo, 0.75), 5, lineType=cv2.LINE_AA)
+
+    # Faint disc the blades sweep through.
     cv2.circle(layers.sharp, (cx, cy), max(2, int(blade_len * 0.99)),
-               _scale(color, 0.30), 1, lineType=cv2.LINE_AA)
+               _scale(halo, 0.22), 1, lineType=cv2.LINE_AA)
 
     draw_rasengan(layers, cx, cy, radius, frame_idx, charge_frac=1.0, color=color)
 
