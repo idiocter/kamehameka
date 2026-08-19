@@ -47,6 +47,7 @@ THROW_SPEED_MIN = 0.055    # normalized frame-to-frame palm speed that counts as
 
 SQUEEZE_RATIO = 1.55       # grip_ratio below this counts as squeezing (a light curl)
 SQUEEZE_HOLD_FRAMES = 4    # debounce, so one noisy frame can't convert the jutsu
+EMERGENCE_PER_FRAME = 1 / 14.0  # ~0.5s for the wind chakra to expand into a shuriken
 
 BASE_RADIUS = 22.0
 RADIUS_PER_CHARGE = 0.10
@@ -73,6 +74,7 @@ def fresh_jutsu():
         "age": 0,
         "lost_frames": 0,
         "squeeze_frames": 0,
+        "emergence": 0.0,   # 0->1 as the wind chakra expands out of the sphere
     }
 
 
@@ -249,7 +251,7 @@ def main():
                 pos = active[anchor][:2] if anchor is not None else (0.5, 0.5)
                 jutsu.update({"state": RASENGAN, "pos": pos, "charge": 0.0,
                               "slot": anchor, "age": 0, "lost_frames": 0,
-                              "squeeze_frames": 0})
+                              "squeeze_frames": 0, "emergence": 0.0})
                 recognizer.reset()
 
         # --- holding a jutsu -------------------------------------------
@@ -298,6 +300,8 @@ def main():
                                 jutsu["state"] = RASENSHURIKEN
                         else:
                             jutsu["squeeze_frames"] = 0
+                    if jutsu["state"] == RASENSHURIKEN:
+                        jutsu["emergence"] = min(1.0, jutsu["emergence"] + EMERGENCE_PER_FRAME)
                     color = FX.RASENSHURIKEN_COLOR if jutsu["state"] == RASENSHURIKEN else FX.RASENGAN_COLOR
                     aura.emit(int(cx * w), int(cy * h), 14, n=2, color=color)
 
@@ -305,7 +309,8 @@ def main():
             ox, oy = int(jutsu["pos"][0] * w), int(jutsu["pos"][1] * h)
             radius = jutsu_radius(jutsu["charge"])
             if jutsu["state"] == RASENSHURIKEN:
-                FX.draw_rasenshuriken(layers, ox, oy, radius, frame_idx)
+                FX.draw_rasenshuriken(layers, ox, oy, radius, frame_idx,
+                                      emergence=jutsu["emergence"])
             else:
                 FX.draw_rasengan(layers, ox, oy, radius, frame_idx,
                                  charge_frac=jutsu["charge"] / MAX_CHARGE)
