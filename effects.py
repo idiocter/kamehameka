@@ -15,6 +15,18 @@ RASENGAN_COLOR = (255, 130, 40)        # BGR - saturated chakra blue
 RASENSHURIKEN_COLOR = (255, 250, 245)  # BGR - white, with only a whisper of blue
 RASENSHURIKEN_HALO = (255, 165, 85)    # BGR - blue, for bloom and rim light only
 
+# Color ramps per jutsu type - lower indices = deeper/bluer, higher =icier/whiter
+RASENGAN_COLOR_RAMP = [
+    (0.0, (255, 30, 10)),    # deep core - very blue
+    (0.5, (255, 130, 40)),   # middle - standard rasengan
+    (1.0, (255, 220, 200)),  # near-white rim
+]
+RASENSHURIKEN_COLOR_RAMP = [
+    (0.0, (255, 30, 10)),    # deep core
+    (0.5, (255, 180, 100)),  # middle - awakening
+    (1.0, (255, 250, 250)),  # near-white fully charged
+]
+
 SOFT_SIGMA = 6.0    # bloom blur
 SHARP_SIGMA = 1.2   # just enough to take the aliasing off an edge
 
@@ -38,6 +50,19 @@ def chakra_color(t):
             f = (t - t0) / (t1 - t0)
             return tuple(a + (b - a) * f for a, b in zip(c0, c1))
     return CHAKRA_STOPS[-1][1]
+
+
+def jutsu_color(charge_frac, ramp):
+    """Sample a jutsu-specific color ramp based on charge fraction.
+    charge_frac: 0.0 .. 1.0
+    ramp: list of (threshold, BGR color) sorted ascending
+    """
+    t = min(1.0, max(0.0, charge_frac))
+    for (t0, c0), (t1, c1) in zip(ramp, ramp[1:]):
+        if t <= t1:
+            f = (t - t0) / (t1 - t0)
+            return tuple(a + (b - a) * f for a, b in zip(c0, c1))
+    return ramp[-1][1]
 
 
 _CHAKRA_LUT = np.array([chakra_color(i / 255.0) for i in range(256)], dtype=np.float32)
@@ -273,7 +298,7 @@ _FILAMENTS = _filament_layout()
 
 
 def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
-                       halo=RASENSHURIKEN_HALO):
+                       halo=RASENSHURIKEN_HALO, velocity=None, speed=0.0):
     """A compact chakra core inside an enormous four-pointed wind shuriken.
 
     The four points are not solid blades. Each is a dense bundle of razor-thin
@@ -286,6 +311,9 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
 
     `emergence` (0..1) drives the transformation - the wind chakra expands out of
     the sphere rather than the sphere simply being scaled up.
+
+    `velocity` and `speed` influence filament twist: a fast throw winds the
+    filaments into a more dynamic, spiralled appearance.
     """
     cx, cy = int(cx), int(cy)
     # ~5 deg/frame. A 4-blade star repeats every 90 deg, so this is one visual
@@ -293,6 +321,17 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
     # actually see the shape.
     spin = frame_idx * 0.09
     e = min(1.0, max(0.0, emergence))
+
+    # --- velocity-dependent filament twist ---
+    twist_offset = 0.0
+    if velocity is not None and speed > 0.0:
+        # Normalize velocity vector; faster speed = more twist
+        vx, vy = velocity
+        v_norm = math.hypot(vx, vy) + 1e-6
+        # Map speed to a twist factor in [-0.2, 0.2]; sign gives handedness
+        twist_factor = (vy / v_norm) * min(1.0, speed / 30.0)
+        twist_offset = twist_factor * 0.15  # radians max offset
+
     blade_len = radius * (1.0 + 3.5 * e)
     # Blades start at the sphere's surface, not inside it - filaments crossing
     # the core would additively wash the deep blue out to white.
@@ -316,7 +355,7 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
                     continue
                 # Strands spiral around the blade axis, so they cross over one
                 # another instead of lying in flat parallel stripes.
-                off = seat * math.cos(phase + twist * t + frame_idx * 0.11)
+                off = seat * math.cos(phase + (twist + twist_offset) * t + frame_idx * 0.11)
                 pts.append((x + tx * w * off, y + ty * w * off))
             if len(pts) < 3:
                 continue
@@ -361,7 +400,7 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
 class JutsuBlast:
     """A thrown Rasengan or Rasenshuriken travelling in a straight line."""
 
-    def __init__(self, x, y, dx, dy, style, speed=28, radius=26):
+    def __init__(self, x, y, dx, dy, style, speed=28, radius=26, velocity=None):
         self.x, self.y = x, y
         self.dx, self.dy = dx, dy
         self.style = style
@@ -372,6 +411,7 @@ class JutsuBlast:
         # The Rasenshuriken gets a short fuse so it goes off inside the frame
         # instead of sailing offscreen; a plain Rasengan just flies away.
         self.life = 16 if self.detonates else 60
+        self.velocity = velocity or (dx, dy)  # normalized or raw velocity
 
     def update(self):
         self.x += self.dx * self.speed
@@ -384,7 +424,9 @@ class JutsuBlast:
 
     def draw(self, layers):
         if self.style == "rasenshuriken":
-            draw_rasenshuriken(layers, self.x, self.y, self.radius, self.frame)
+            speed_factor = math.hypot(self.dx, self.dy) * self.speed
+            draw_rasenshuriken(layers, self.x, self.y, self.radius, self.frame,
+                               velocity=self.velocity, speed=speed_factor)
         else:
             draw_rasengan(layers, self.x, self.y, self.radius, self.frame * 3)
 
@@ -399,9 +441,12 @@ class WindDome:
         self.max_life = life
         self.color = color
         self.needles = [(random.uniform(0, 2 * math.pi), random.uniform(0.7, 1.15)) for _ in range(26)]
+        self._finished = False
 
     def update(self):
         self.life -= 1
+        if self.life <= 0:
+            self._finished = True
 
     def offscreen(self, w, h):
         return self.life <= 0
@@ -426,3 +471,51 @@ class WindDome:
 
         draw_soft_glow_circle(layers.soft, (self.x, self.y), radius * 0.4, self.color,
                               intensity=fade * 1.2, rings=4)
+
+    @property
+    def finished(self):
+        return self._finished
+
+
+class WindSplash:
+    """Impact splash that appears after WindDome completes - radiating wind blades."""
+
+    def __init__(self, x, y, max_radius=300, life=20, color=RASENSHURIKEN_COLOR):
+        self.x, self.y = int(x), int(y)
+        self.max_radius = max_radius
+        self.life = life
+        self.max_life = life
+        self.color = color
+        self.needles = [(random.uniform(0, 2 * math.pi), random.uniform(0.8, 1.3)) for _ in range(32)]
+
+    def update(self):
+        self.life -= 1
+
+    def offscreen(self, w, h):
+        return self.life <= 0
+
+    def draw(self, layers):
+        t = 1.0 - self.life / self.max_life           # 1 -> 0 over the splash
+        radius = self.max_radius * t
+        fade = (self.life / self.max_life) ** 0.7
+
+        # Radiating blades
+        for ang, span in self.needles:
+            r0 = radius * 0.3 * span
+            r1 = radius * 0.9 * span
+            cv2.line(layers.sharp,
+                     (int(self.x + math.cos(ang) * r0), int(self.y + math.sin(ang) * r0)),
+                     (int(self.x + math.cos(ang) * r1), int(self.y + math.sin(ang) * r1)),
+                     _scale(self.color, fade), max(1, int(2 * fade)), lineType=cv2.LINE_AA)
+
+        # Outer glowing ring
+        cv2.circle(layers.sharp, (self.x, self.y), max(2, int(radius)),
+                   _scale(self.color, fade * 0.6), max(1, int(4 * fade)), lineType=cv2.LINE_AA)
+
+        # Inner core
+        cv2.circle(layers.sharp, (self.x, self.y), max(2, int(radius * 0.4)),
+                   _scale(self.color, fade), max(1, int(2 * fade)), lineType=cv2.LINE_AA)
+
+        # Soft bloom underneath
+        draw_soft_glow_circle(layers.soft, (self.x, self.y), radius * 0.6, self.color,
+                              intensity=fade * 1.5, rings=5)

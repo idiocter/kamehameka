@@ -323,6 +323,7 @@ def main():
             if p.offscreen(w, h):
                 if getattr(p, "detonates", False) and p.life <= 0:
                     next_projectiles.append(FX.WindDome(p.x, p.y))
+                    next_projectiles.append(FX.WindSplash(p.x, p.y))
                 continue
             p.draw(layers)
             next_projectiles.append(p)
