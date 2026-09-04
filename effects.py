@@ -438,7 +438,8 @@ _FILAMENTS = _filament_layout()
 
 
 def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
-                       halo=RASENSHURIKEN_HALO, velocity=None, speed=0.0):
+                       halo=RASENSHURIKEN_HALO, velocity=None, speed=0.0,
+                       thrown=False, throw_frame=0):
     """A compact chakra core inside an enormous four-pointed wind shuriken.
 
     The four points are not solid blades. Each is a dense bundle of razor-thin
@@ -454,13 +455,96 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
 
     `velocity` and `speed` influence filament twist: a fast throw winds the
     filaments into a more dynamic, spiralled appearance.
+
+    When `thrown=True`, the shuriken expands dramatically and spins at god-like speed.
+    `throw_frame` tracks frames since throw for growth/animation.
     """
     cx, cy = int(cx), int(cy)
-    # ~5 deg/frame. A 4-blade star repeats every 90 deg, so this is one visual
-    # cycle every ~18 frames - fast enough to feel like a spin, slow enough to
-    # actually see the shape.
-    spin = frame_idx * 0.09
     e = min(1.0, max(0.0, emergence))
+
+    # --- Thrown mode: massive expansion + god-tier rotation ---
+    if thrown:
+        # Rapid expansion: grows to 4x size over ~12 frames
+        growth = min(1.0, throw_frame / 12.0)
+        expansion = 1.0 + growth * 3.5  # 1x -> 4.5x
+        # God-like spin: ~90 deg/frame (4-blade = full cycle every 4 frames!)
+        spin = throw_frame * 1.57  # ~PI/2 per frame = 90 deg/frame
+        # Filaments go wild with speed
+        filament_spin_mult = 8.0
+        blade_len = radius * expansion * (1.0 + 3.5 * e)
+        inner = radius * expansion * 1.02
+        # Intensity ramps up then sustains
+        intensity = 0.7 + 0.3 * min(1.0, throw_frame / 8.0)
+    else:
+        # Normal held mode
+        spin = frame_idx * 0.09
+        expansion = 1.0
+        filament_spin_mult = 1.0
+        blade_len = radius * (1.0 + 3.5 * e)
+        inner = radius * 1.02
+        intensity = 1.0
+
+    chunk = max(1, _BLADE_SAMPLES // 3)
+
+    # --- velocity-dependent filament twist ---
+    twist_offset = 0.0
+    if velocity is not None and speed > 0.0:
+        vx, vy = velocity
+        v_norm = math.hypot(vx, vy) + 1e-6
+        twist_factor = (vy / v_norm) * min(1.0, speed / 30.0)
+        twist_offset = twist_factor * 0.15
+
+    for k in range(4):
+        angle = spin + k * (math.pi / 2)
+        spine = _blade_spine(cx, cy, angle, inner, blade_len, samples=_BLADE_SAMPLES)
+
+        # Volumetric glow - scales with expansion
+        cv2.fillPoly(layers.soft, [_blade_polygon(spine, scale=1.15)],
+                     _scale(halo, 0.28 * e * intensity), lineType=cv2.LINE_AA)
+
+        for seat, t_start, twist, phase, bright in _FILAMENTS:
+            pts = []
+            for i, (x, y, tx, ty, w) in enumerate(spine):
+                t = i / _BLADE_SAMPLES
+                if t < t_start:
+                    continue
+                # Strands spiral around blade axis - MUCH faster when thrown
+                off = seat * math.cos(phase + (twist * filament_spin_mult + twist_offset) * t + frame_idx * 0.11 * filament_spin_mult)
+                pts.append((x + tx * w * off, y + ty * w * off))
+            if len(pts) < 3:
+                continue
+            arr = np.array([[int(px), int(py)] for px, py in pts], dtype=np.int32)
+
+            # Drawn in radial chunks so colour climbs the ramp along the strand.
+            for c0 in range(0, len(arr) - 1, chunk):
+                seg = arr[c0:c0 + chunk + 1]
+                if len(seg) < 2:
+                    continue
+                t_mid = t_start + (c0 + chunk * 0.5) / _BLADE_SAMPLES
+                shade = chakra_color(min(1.0, 0.28 + t_mid * 0.85))
+                cv2.polylines(layers.sharp, [seg], False,
+                              _scale(shade, bright * (0.5 + 0.5 * e) * intensity), 1, lineType=cv2.LINE_AA)
+
+        # Microscopic cutting structures - also spin faster when thrown
+        for j, (seat, _t0, _tw, phase, _br) in enumerate(_FILAMENTS[::3]):
+            i = 6 + (j * 3) % max(1, _BLADE_SAMPLES - 7)
+            sx, sy, stx, sty, sw = spine[i]
+            off = seat * math.cos(phase + frame_idx * 0.11 * filament_spin_mult)
+            px, py = sx + stx * sw * off, sy + sty * sw * off
+            rx, ry = sty, -stx
+            ln = sw * 0.55 * e * intensity
+            cv2.line(layers.sharp,
+                     (int(px - rx * ln), int(py - ry * ln)),
+                     (int(px + rx * ln), int(py + ry * ln)),
+                     _scale(chakra_color(0.97), 0.55 * e * intensity), 1, lineType=cv2.LINE_AA)
+
+    # Outer boundary disc - expands with shuriken
+    cv2.circle(layers.sharp, (cx, cy), max(2, int(blade_len * 0.99)),
+               _scale(halo, 0.18 * e * intensity), 1, lineType=cv2.LINE_AA)
+
+    # Central sphere - also expands when thrown
+    core_radius = radius * expansion if thrown else radius
+    draw_rasengan(layers, cx, cy, core_radius, frame_idx, charge_frac=1.0)
 
     # --- velocity-dependent filament twist ---
     twist_offset = 0.0
@@ -565,8 +649,10 @@ class JutsuBlast:
     def draw(self, layers):
         if self.style == "rasenshuriken":
             speed_factor = math.hypot(self.dx, self.dy) * self.speed
+            # Thrown rasenshuriken: massive expansion + god-tier rotation
             draw_rasenshuriken(layers, self.x, self.y, self.radius, self.frame,
-                               velocity=self.velocity, speed=speed_factor)
+                               velocity=self.velocity, speed=speed_factor,
+                               thrown=True, throw_frame=self.frame)
         else:
             # Use fast path for projectiles - no charge frac, simpler rendering
             cx, cy = int(self.x), int(self.y)
