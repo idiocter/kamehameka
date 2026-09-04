@@ -92,58 +92,171 @@ def _scale(color, k):
 
 
 class GlowLayers:
-    """Two accumulation buffers: heavy-blurred bloom, and light-blurred detail."""
+    """Two accumulation buffers: heavy-blurred bloom, and light-blurred detail.
+
+    Buffers are reused across frames to avoid allocation overhead.
+    """
 
     def __init__(self, shape):
         self.soft = _glow_layer(shape)
         self.sharp = _glow_layer(shape)
+        self._shape = shape
+        self._soft_blur = np.empty(shape, dtype=np.float32)
+        self._sharp_blur = np.empty(shape, dtype=np.float32)
+
+    def reset(self):
+        """Clear buffers for next frame."""
+        self.soft.fill(0.0)
+        self.sharp.fill(0.0)
 
     def composite(self, frame, soft_sigma=SOFT_SIGMA, sharp_sigma=SHARP_SIGMA):
-        soft = cv2.GaussianBlur(self.soft, (0, 0), sigmaX=soft_sigma, sigmaY=soft_sigma)
-        sharp = cv2.GaussianBlur(self.sharp, (0, 0), sigmaX=sharp_sigma, sigmaY=sharp_sigma)
-        return blend_additive(frame, soft + sharp)
+        # In-place blur to preallocated buffers (avoids allocation)
+        cv2.GaussianBlur(self.soft, (0, 0), sigmaX=soft_sigma, sigmaY=soft_sigma, dst=self._soft_blur)
+        cv2.GaussianBlur(self.sharp, (0, 0), sigmaX=sharp_sigma, sigmaY=sharp_sigma, dst=self._sharp_blur)
+        # Combine and add to frame
+        combined = self._soft_blur + self._sharp_blur
+        out = frame.astype(np.float32) + combined
+        np.clip(out, 0, 255, out=out)
+        return out.astype(np.uint8)
 
 
 _SPHERE_CACHE = {}
+_SPHERE_NORMAL_CACHE = {}
+_SPHERE_SPECULAR_CACHE = {}
 
 
 def _sphere_patch(radius):
-    """A dense sphere with a deep-blue core grading out to pale icy blue.
+    """A dense sphere with deep-blue core grading to pale icy blue + 3D shading data.
 
-    Built as one array rather than stacked circles because the layers are added,
-    not painted over - concentric additive circles would just pile up into a
-    white blob at the centre, which is the opposite of the intended hierarchy.
-    Cached per integer radius; the geometry only depends on size.
+    Returns dict with: 'color' (BGR float32), 'alpha', 'normal_z', 'depth', 'specular_mask'
+    All cached per integer radius.
     """
     r = max(3, int(radius))
-    patch = _SPHERE_CACHE.get(r)
-    if patch is not None:
-        return patch
+    cached = _SPHERE_CACHE.get(r)
+    if cached is not None:
+        return cached
 
     yy, xx = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
-    d = np.hypot(xx, yy) / r                       # 0 at centre, 1 at the rim
-    # Exponent holds the deep core wide and pushes the pale shades into a thin
-    # outer shell, so the sphere reads as dense rather than as a soft gradient.
-    color = _CHAKRA_LUT[np.clip(d ** 1.5 * 0.85 * 255, 0, 255).astype(np.uint8)]
-    # Solid through the body, then a quick fade - a compressed sphere needs a
-    # defined boundary, not a soft cloud.
+    d = np.hypot(xx, yy) / r                       # 0 at centre, 1 at rim
+    valid = d <= 1.0
+
+    # --- Base color from chakra ramp (core to rim) ---
+    color_idx = np.clip(d ** 1.5 * 0.85 * 255, 0, 255).astype(np.uint8)
+    base_color = _CHAKRA_LUT[color_idx]            # (H, W, 3) float32
+
+    # --- Alpha: solid core, sharp falloff at edge ---
     alpha = np.clip((1.08 - d) / 0.22, 0.0, 1.0)
     density = 0.62 + 0.38 * np.clip(1.0 - d, 0.0, 1.0)
-    patch = color * (alpha * density)[..., None]
+    alpha *= density
 
+    # --- 3D normals (sphere surface) ---
+    # For a sphere: normal = (x, y, z) / r where z = sqrt(r^2 - x^2 - y^2)
+    z = np.sqrt(np.maximum(0.0, 1.0 - d * d))
+    normal_z = z                                     # facing camera = 1.0 at center
+
+    # --- Specular mask (Phong-like highlight) ---
+    # Light from upper-left: light_dir ≈ (-0.3, -0.3, 0.9)
+    # View dir = (0, 0, 1). Half-vector H = normalize(light + view)
+    # Specular ~ max(0, N·H)^shininess
+    shininess = 64.0
+    hx, hy, hz = -0.21, -0.21, 0.98  # Pre-normalized half-vector
+    nh = normal_z * hz  # nx*hx + ny*hy + nz*hz, but nx,ny small near center
+    specular = np.power(np.maximum(0.0, nh), shininess)
+    specular = np.where(valid, specular, 0.0)
+
+    # --- Rim lighting (fresnel-like) ---
+    rim = np.power(1.0 - normal_z, 2.5)
+    rim = np.where(valid, rim, 0.0)
+
+    # --- Depth for occlusion sorting ---
+    depth = 1.0 - d  # 1 at center, 0 at rim
+
+    patch = {
+        'color': base_color,
+        'alpha': alpha[..., None],
+        'normal_z': normal_z[..., None],
+        'depth': depth[..., None],
+        'specular': specular[..., None],
+        'rim': rim[..., None],
+        'valid': valid[..., None],
+        'radius': r,
+    }
     _SPHERE_CACHE[r] = patch
     return patch
 
 
+def _sphere_patch_fast(radius):
+    """Lightweight version for projectiles - just color + alpha."""
+    r = max(3, int(radius))
+    cached = _SPHERE_SPECULAR_CACHE.get(r)
+    if cached is not None:
+        return cached
+
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
+    d = np.hypot(xx, yy) / r
+    valid = d <= 1.0
+
+    color_idx = np.clip(d ** 1.5 * 0.85 * 255, 0, 255).astype(np.uint8)
+    base_color = _CHAKRA_LUT[color_idx]
+
+    alpha = np.clip((1.08 - d) / 0.22, 0.0, 1.0)
+    alpha *= (0.62 + 0.38 * np.clip(1.0 - d, 0.0, 1.0))
+
+    # Simple specular highlight
+    z = np.sqrt(np.maximum(0.0, 1.0 - d * d))
+    specular = np.power(np.maximum(0.0, z * 0.98), 32.0)
+    specular = np.where(valid, specular, 0.0)
+
+    patch = {
+        'color': base_color,
+        'alpha': alpha[..., None],
+        'specular': specular[..., None],
+        'valid': valid[..., None],
+        'radius': r,
+    }
+    _SPHERE_SPECULAR_CACHE[r] = patch
+    return patch
+
+
 def _add_patch(dst, patch, cx, cy):
-    """Add a BGR patch centred at (cx, cy), clipped to the destination bounds."""
-    ph, pw = patch.shape[:2]
+    """Add a BGR patch centred at (cx, cy), clipped to the destination bounds.
+    Handles both legacy array patches and new dict patches with 3D shading.
+    """
+    if isinstance(patch, dict):
+        color = patch['color']
+        alpha = patch['alpha']
+        specular = patch.get('specular')
+        rim = patch.get('rim')
+        valid = patch['valid']
+        ph, pw = color.shape[:2]
+    else:
+        color = patch
+        alpha = None
+        specular = None
+        rim = None
+        valid = None
+        ph, pw = patch.shape[:2]
+
     y0, x0 = int(cy) - ph // 2, int(cx) - pw // 2
     dy0, dx0 = max(0, y0), max(0, x0)
     dy1, dx1 = min(dst.shape[0], y0 + ph), min(dst.shape[1], x0 + pw)
     if dy0 >= dy1 or dx0 >= dx1:
         return
-    dst[dy0:dy1, dx0:dx1] += patch[dy0 - y0:dy1 - y0, dx0 - x0:dx1 - x0]
+
+    sy0, sx0 = dy0 - y0, dx0 - x0
+    sy1, sx1 = sy0 + (dy1 - dy0), sx0 + (dx1 - dx0)
+
+    if alpha is not None:
+        a = alpha[sy0:sy1, sx0:sx1]
+        dst[dy0:dy1, dx0:dx1] += color[sy0:sy1, sx0:sx1] * a
+        if specular is not None:
+            s = specular[sy0:sy1, sx0:sx1]
+            dst[dy0:dy1, dx0:dx1] += s * 255.0  # White specular highlight
+        if rim is not None:
+            rm = rim[sy0:sy1, sx0:sx1]
+            dst[dy0:dy1, dx0:dx1] += rm * 80.0  # Rim light (cool blue-white)
+    else:
+        dst[dy0:dy1, dx0:dx1] += color[sy0:sy1, sx0:sx1]
 
 
 def draw_soft_glow_circle(dst, center, radius, color, intensity=1.0, rings=4):
@@ -190,45 +303,72 @@ class AuraParticles:
 
 
 def draw_rasengan(layers, cx, cy, radius, frame_idx, charge_frac=1.0):
-    """A compact sphere of compressed chakra rotating in several directions at once.
-
-    Deep electric blue at the core grading out through royal blue to a pale icy
-    rim, with spiral currents wrapping around and through it on independent axes
-    so the rotation reads as multidirectional rather than a single spin.
-    """
+    """3D Rasengan with dynamic lighting, rotating surface detail, and depth."""
     cx, cy = int(cx), int(cy)
     pulse = 1.0 + 0.05 * math.sin(frame_idx * 0.45)
     r = max(4.0, radius * pulse)
     brightness = 0.78 + 0.30 * charge_frac
 
-    # Atmospheric glow, drawn as an annulus rather than stacked filled circles:
-    # those all overlap at the centre and dump ~2.7x their colour there, washing
-    # the deep-blue core out to white.
-    cv2.circle(layers.soft, (cx, cy), max(2, int(r * 1.3)),
-               _scale(chakra_color(0.32), 0.85 * brightness),
-               max(2, int(r * 0.8)), lineType=cv2.LINE_AA)
+    # --- 1. Atmospheric bloom (soft layer) ---
+    glow_r = max(2, int(r * 1.35))
+    cv2.circle(layers.soft, (cx, cy), glow_r,
+               _scale(chakra_color(0.28), 0.75 * brightness),
+               max(2, int(r * 0.75)), lineType=cv2.LINE_AA)
 
-    _add_patch(layers.sharp, _sphere_patch(r) * brightness, cx, cy)
+    # Outer pulse ring for energy feel
+    pulse_phase = frame_idx * 0.15
+    pulse_r = int(r * 1.15 + 2.0 * math.sin(pulse_phase))
+    if pulse_r > 2:
+        cv2.circle(layers.soft, (cx, cy), pulse_r,
+                   _scale(chakra_color(0.45), 0.35 * brightness * abs(math.sin(pulse_phase))),
+                   1, lineType=cv2.LINE_AA)
 
-    # Spiral currents on independent axes. Each ellipse is a great circle seen
-    # edge-on at its own tilt, so together they read as one sphere turning
-    # several ways at once instead of a stack of flat rings.
-    for i in range(4):
-        rr = max(2, int(r * (0.55 + 0.15 * i)))
-        squash = 0.20 + 0.30 * abs(math.sin(frame_idx * (0.06 + 0.018 * i) + i))
-        tilt = (frame_idx * (7.0 + 5.0 * i) + i * 47) % 360
-        start = (frame_idx * (11.0 - 2.5 * i)) % 360
+    # --- 2. Core sphere with 3D shading (sharp layer) ---
+    sphere = _sphere_patch(r)
+    _add_patch(layers.sharp, sphere, cx, cy)
+
+    # Brightness modulation applied via scaling the patch contribution
+    if brightness != 1.0:
+        r_int = sphere['radius']
+        ph, pw = r_int * 2 + 1, r_int * 2 + 1
+        y0, x0 = cy - r_int, cx - r_int
+        dy0, dx0 = max(0, y0), max(0, x0)
+        dy1, dx1 = min(layers.sharp.shape[0], y0 + ph), min(layers.sharp.shape[1], x0 + pw)
+        if dy0 < dy1 and dx0 < dx1:
+            sy0, sx0 = dy0 - y0, dx0 - x0
+            sy1, sx1 = sy0 + (dy1 - dy0), sx0 + (dx1 - dx0)
+            layers.sharp[dy0:dy1, dx0:dx1] *= brightness
+
+    # --- 3. Rotating surface currents (fewer, optimized) ---
+    # Precompute animation parameters
+    t = frame_idx * 0.02
+    for i in range(3):
+        rr = max(2, int(r * (0.50 + 0.18 * i)))
+        squash = 0.15 + 0.35 * abs(math.sin(t * (0.7 + 0.15 * i) + i * 1.3))
+        tilt = (frame_idx * (6.0 + 4.5 * i) + i * 53) % 360
+        start = (frame_idx * (9.0 - 2.0 * i)) % 360
+        color = _scale(chakra_color(0.55 + 0.1 * i), 0.95 * brightness)
+        thickness = max(1, int(r * 0.06))
         cv2.ellipse(layers.sharp, (cx, cy), (rr, max(2, int(rr * squash))), tilt,
-                    start, start + 230, _scale(chakra_color(0.62), 1.05 * brightness),
-                    max(1, int(r * 0.07)), lineType=cv2.LINE_AA)
+                    start, start + 220, color, thickness, lineType=cv2.LINE_AA)
 
-    # Near-white highlights ride the fastest-moving surface currents.
-    for i in range(4):
-        a = frame_idx * 0.30 + i * (math.pi / 2)
-        wx = cx + math.cos(a) * r * 0.92
-        wy = cy + math.sin(a) * r * 0.66
-        cv2.circle(layers.sharp, (int(wx), int(wy)), max(1, int(r * 0.09)),
-                   _scale(chakra_color(1.0), 0.9 * brightness), -1, lineType=cv2.LINE_AA)
+    # --- 4. Specular highlight orbit (simulates 3D rotation) ---
+    # Two highlights orbiting on different latitudes
+    for i in range(2):
+        lat = 0.35 + 0.25 * i  # Latitude on sphere
+        lon_speed = 0.28 + 0.07 * i
+        a = frame_idx * lon_speed + i * math.pi
+        # Project 3D sphere point to 2D
+        hx = cx + math.cos(a) * r * math.sqrt(1.0 - lat * lat) * 0.95
+        hy = cy + math.sin(a) * r * math.sqrt(1.0 - lat * lat) * 0.7 + lat * r * 0.3
+        hl_r = max(1, int(r * 0.07))
+        cv2.circle(layers.sharp, (int(hx), int(hy)), hl_r,
+                   _scale(chakra_color(1.0), 1.2 * brightness), -1, lineType=cv2.LINE_AA)
+
+    # --- 5. Subsurface scattering hint (inner glow bleed) ---
+    inner_r = max(1, int(r * 0.35))
+    cv2.circle(layers.soft, (cx, cy), inner_r,
+               _scale(chakra_color(0.15), 0.4 * brightness), -1, lineType=cv2.LINE_AA)
 
 
 BLADE_SWEEP = -0.40   # radians the centreline curls back over the blade's length
@@ -428,7 +568,21 @@ class JutsuBlast:
             draw_rasenshuriken(layers, self.x, self.y, self.radius, self.frame,
                                velocity=self.velocity, speed=speed_factor)
         else:
-            draw_rasengan(layers, self.x, self.y, self.radius, self.frame * 3)
+            # Use fast path for projectiles - no charge frac, simpler rendering
+            cx, cy = int(self.x), int(self.y)
+            r = max(4.0, self.radius)
+            sphere = _sphere_patch_fast(r)
+            _add_patch(layers.sharp, sphere, cx, cy)
+            # Quick glow
+            cv2.circle(layers.soft, (cx, cy), int(r * 1.3),
+                       _scale(chakra_color(0.3), 0.7), max(2, int(r * 0.7)), lineType=cv2.LINE_AA)
+            # Rotation hint
+            a = self.frame * 0.3
+            for i in range(2):
+                hx = cx + math.cos(a + i * math.pi) * r * 0.7
+                hy = cy + math.sin(a + i * math.pi) * r * 0.5
+                cv2.circle(layers.sharp, (int(hx), int(hy)), max(1, int(r * 0.06)),
+                           _scale(chakra_color(1.0), 1.0), -1, lineType=cv2.LINE_AA)
 
 
 class WindDome:

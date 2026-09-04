@@ -201,6 +201,7 @@ def main():
 
     frame_idx = 0
     connections = mp_hands.HAND_CONNECTIONS
+    layers = None
 
     while True:
         ok, frame = cap.read()
@@ -208,11 +209,13 @@ def main():
             break
         frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
+        if layers is None:
+            layers = FX.GlowLayers(frame.shape)
+        else:
+            layers.reset()
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         result = hands.process(rgb)
-
-        layers = FX.GlowLayers(frame.shape)
 
         raw_hands = result.multi_hand_landmarks if result.multi_hand_landmarks else []
         detections = [(*G.palm_center(hlm.landmark), hlm.landmark) for hlm in raw_hands]
