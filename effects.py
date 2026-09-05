@@ -467,10 +467,12 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
         # Rapid expansion: grows to 4x size over ~12 frames
         growth = min(1.0, throw_frame / 12.0)
         expansion = 1.0 + growth * 3.5  # 1x -> 4.5x
-        # God-like spin: ~90 deg/frame (4-blade = full cycle every 4 frames!)
-        spin = throw_frame * 1.57  # ~PI/2 per frame = 90 deg/frame
-        # Filaments go wild with speed
-        filament_spin_mult = 8.0
+        # 50 rotations/second at 30 FPS = 1.667 rotations/frame = 10.47 rad/frame
+        # 4-blade symmetry: visual repeat every π/2, so this = 6.67 visual cycles/frame
+        SPIN_PER_FRAME = 10.47  # radians = 50 RPS @ 30 FPS
+        spin = throw_frame * SPIN_PER_FRAME
+        # Filaments spin even faster for insane blur effect
+        filament_spin_mult = 20.0
         blade_len = radius * expansion * (1.0 + 3.5 * e)
         inner = radius * expansion * 1.02
         # Intensity ramps up then sustains
