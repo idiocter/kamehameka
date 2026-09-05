@@ -75,6 +75,7 @@ def fresh_jutsu():
         "lost_frames": 0,
         "squeeze_frames": 0,
         "emergence": 0.0,   # 0->1 as the wind chakra expands out of the sphere
+        "energize_frame": 0,  # frames since Rasenshuriken formation (for exponential spin)
     }
 
 
@@ -305,6 +306,9 @@ def main():
                             jutsu["squeeze_frames"] = 0
                     if jutsu["state"] == RASENSHURIKEN:
                         jutsu["emergence"] = min(1.0, jutsu["emergence"] + EMERGENCE_PER_FRAME)
+                        jutsu["energize_frame"] += 1
+                    else:
+                        jutsu["energize_frame"] = 0
                     color = FX.RASENSHURIKEN_COLOR if jutsu["state"] == RASENSHURIKEN else FX.RASENGAN_COLOR
                     aura.emit(int(cx * w), int(cy * h), 14, n=2, color=color)
 
@@ -313,7 +317,8 @@ def main():
             radius = jutsu_radius(jutsu["charge"])
             if jutsu["state"] == RASENSHURIKEN:
                 FX.draw_rasenshuriken(layers, ox, oy, radius, frame_idx,
-                                      emergence=jutsu["emergence"])
+                                      emergence=jutsu["emergence"],
+                                      energize_frame=jutsu["energize_frame"])
             else:
                 FX.draw_rasengan(layers, ox, oy, radius, frame_idx,
                                  charge_frac=jutsu["charge"] / MAX_CHARGE)

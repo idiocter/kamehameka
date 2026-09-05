@@ -439,7 +439,7 @@ _FILAMENTS = _filament_layout()
 
 def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
                        halo=RASENSHURIKEN_HALO, velocity=None, speed=0.0,
-                       thrown=False, throw_frame=0):
+                       thrown=False, throw_frame=0, energize_frame=0):
     """A compact chakra core inside an enormous four-pointed wind shuriken.
 
     The four points are not solid blades. Each is a dense bundle of razor-thin
@@ -458,6 +458,9 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
 
     When `thrown=True`, the shuriken expands dramatically and spins at god-like speed.
     `throw_frame` tracks frames since throw for growth/animation.
+
+    When `energize_frame > 0` (held Rasenshuriken), rotation speed increases
+    exponentially from base to 50 RPS as emergence goes 0->1.
     """
     cx, cy = int(cx), int(cy)
     e = min(1.0, max(0.0, emergence))
@@ -477,8 +480,27 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
         inner = radius * expansion * 1.02
         # Intensity ramps up then sustains
         intensity = 0.7 + 0.3 * min(1.0, throw_frame / 8.0)
+    elif energize_frame > 0:
+        # --- Energizing mode (held): exponential spin-up to 50 RPS ---
+        # emergence goes 0->1 over ~14 frames (EMERGENCE_PER_FRAME = 1/14)
+        # Spin starts slow, accelerates exponentially to 50 RPS at full emergence
+        # Base: 2 RPS = 0.42 rad/frame, Peak: 50 RPS = 10.47 rad/frame
+        # Exponential curve: spin_rate = base * (peak/base)^emergence
+        base_rps = 2.0
+        peak_rps = 50.0
+        base_spin = base_rps * 2.0 * math.pi / 30.0  # rad/frame
+        peak_spin = peak_rps * 2.0 * math.pi / 30.0  # rad/frame
+        # Exponential interpolation
+        spin_rate = base_spin * math.exp(math.log(peak_spin / base_spin) * e)
+        spin = energize_frame * spin_rate
+        # Filaments also accelerate exponentially
+        filament_spin_mult = 1.0 + 19.0 * (e ** 2)  # 1x -> 20x
+        expansion = 1.0 + 0.5 * e  # Slight expansion during energize (1x -> 1.5x)
+        blade_len = radius * expansion * (1.0 + 3.5 * e)
+        inner = radius * expansion * 1.02
+        intensity = 0.5 + 0.5 * e  # Brightness ramps with emergence
     else:
-        # Normal held mode
+        # Normal held mode (shouldn't happen for Rasenshuriken, but fallback)
         spin = frame_idx * 0.09
         expansion = 1.0
         filament_spin_mult = 1.0
