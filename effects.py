@@ -386,11 +386,49 @@ def _filament_layout(count=FILAMENTS_PER_BLADE, seed=17):
 _FILAMENTS = _filament_layout()
 
 
+# Radians per nominal 30 Hz animation tick: 35 revolutions per second.
+SHURIKEN_SPIN_START = 0.16
+SHURIKEN_SPIN_PEAK = math.tau * 35.0 / 30.0
+SHURIKEN_SPIN_RAMP = 14.0
+
+
 def shuriken_phase(frame_idx, energize_frame=0):
-    """Continuous angle: accelerate for 14 animation ticks, then keep that speed."""
+    """Integrate smooth spin-up, retaining full speed after wind formation."""
     age = max(0.0, energize_frame)
-    ramp = min(age, 14.0)
-    return frame_idx * 0.16 + 0.008 * ramp * ramp + 0.224 * max(0.0, age - 14.0)
+    u = min(1.0, age / SHURIKEN_SPIN_RAMP)
+    # Integral of smoothstep(u): u**3 - u**4 / 2.
+    accelerated = SHURIKEN_SPIN_RAMP * (u ** 3 - 0.5 * u ** 4)
+    accelerated += max(0.0, age - SHURIKEN_SPIN_RAMP)
+    return (frame_idx * SHURIKEN_SPIN_START
+            + (SHURIKEN_SPIN_PEAK - SHURIKEN_SPIN_START) * accelerated)
+
+
+def _draw_wind_disc(layers, cx, cy, inner, outer, frame_idx, strength):
+    """Continuous angular exposure prevents fast blades aliasing into slow ones.
+
+    Only calculate the visible image region. A full-turn exposure supplies the
+    wind envelope; moving curved streaks supply direction without flashing.
+    """
+    extent = int(math.ceil(outer)) + 2
+    x0, x1 = max(0, cx - extent), min(layers.sharp.shape[1], cx + extent + 1)
+    y0, y1 = max(0, cy - extent), min(layers.sharp.shape[0], cy + extent + 1)
+    if x0 >= x1 or y0 >= y1:
+        return
+    yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+    distance = np.hypot(xx - cx, yy - cy)
+    t = np.clip((distance - inner) / max(1.0, outer - inner), 0.0, 1.0)
+    envelope = np.maximum(0.0, np.sin(math.pi * t)) ** 0.7
+    bands = 0.78 + 0.22 * np.cos(t * 36.0 - frame_idx * 0.65)
+    luminance = envelope * bands * strength
+    layers.sharp[y0:y1, x0:x1] += luminance[..., None] * np.array((190, 175, 145), np.float32)
+    layers.soft[y0:y1, x0:x1] += luminance[..., None] * np.array((70, 50, 25), np.float32)
+    for i in range(7):
+        radius = max(2, int(inner + (outer - inner) * (0.20 + i * 0.105)))
+        start = frame_idx * (17.0 + i * 1.3) + i * 137.5
+        cv2.ellipse(layers.sharp, (cx, cy), (radius, radius), 0,
+                    start % 360, start % 360 + 95 + i * 9,
+                    _scale(RASENSHURIKEN_COLOR, strength * (0.55 + 0.04 * i)),
+                    max(1, int(outer * 0.008)), cv2.LINE_AA)
 
 
 def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
@@ -398,8 +436,8 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
                        thrown=False, throw_frame=0, energize_frame=0, spin_phase=None):
     """Four tapered white wind blades surrounding a swirling blue chakra core.
 
-    Short angular afterimages suggest speed while preserving the four-point
-    silhouette. Throw growth is restrained so the core and tips stay readable.
+    Four points emerge during formation, then dissolve into a continuous wind
+    exposure at full speed. The blue core remains visible inside the white blur.
     """
     cx, cy = int(cx), int(cy)
     e = min(1.0, max(0.0, emergence))
@@ -413,18 +451,24 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
     inner = core_radius * 0.78
     spin = shuriken_phase(frame_idx, energize_frame) if spin_phase is None else spin_phase
 
+    blade_layer = np.zeros_like(layers.sharp)
+    blur = eased * eased
+    visibility = 1.0 - 0.97 * blur
+    if blur > 0.0:
+        _draw_wind_disc(layers, cx, cy, core_radius * 1.04, outer, frame_idx, blur)
+
     for k in range(4):
         angle = spin + k * math.pi / 2
         # Trailing exposures belong in bloom, leaving dark gaps between points.
         for lag, strength in ((0.30, 0.12), (0.15, 0.24)):
             trail = _blade_spine(cx, cy, angle - lag, inner, outer, _BLADE_SAMPLES)
             cv2.fillPoly(layers.soft, [_blade_polygon(trail, 1.1)],
-                         _scale(halo, strength * e), cv2.LINE_AA)
+                         _scale(halo, strength * e * visibility), cv2.LINE_AA)
         spine = _blade_spine(cx, cy, angle, inner, outer, _BLADE_SAMPLES)
-        cv2.fillPoly(layers.sharp, [_blade_polygon(spine)],
-                     _scale((235, 213, 175), 0.60 * e), cv2.LINE_AA)
-        cv2.fillPoly(layers.sharp, [_blade_polygon(spine, 0.7)],
-                     _scale(RASENSHURIKEN_COLOR, 0.78 * e), cv2.LINE_AA)
+        cv2.fillPoly(blade_layer, [_blade_polygon(spine)],
+                     _scale((235, 213, 175), 0.60 * e * visibility), cv2.LINE_AA)
+        cv2.fillPoly(blade_layer, [_blade_polygon(spine, 0.7)],
+                     _scale(RASENSHURIKEN_COLOR, 0.78 * e * visibility), cv2.LINE_AA)
         # Flowing hairline streaks inside the luminous wind envelope.
         for seat, t_start, twist, phase, bright in _FILAMENTS[::3]:
             pts = []
@@ -434,9 +478,11 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
                     continue
                 offset = seat * math.cos(phase + twist * t - frame_idx * 0.22)
                 pts.append((x + tx * width * offset, y + ty * width * offset))
-            cv2.polylines(layers.sharp, [np.asarray(pts, dtype=np.int32)], False,
-                          _scale(RASENSHURIKEN_COLOR, e * (0.84 + 0.16 * bright)),
+            cv2.polylines(blade_layer, [np.asarray(pts, dtype=np.int32)], False,
+                          _scale(RASENSHURIKEN_COLOR, e * visibility * (0.84 + 0.16 * bright)),
                           1, cv2.LINE_AA)
+
+    layers.sharp += blade_layer
 
     # Broken wind arcs around the hub, not a full circular outer blade border.
     for i in range(3):
@@ -508,7 +554,7 @@ class JutsuBlast:
             draw_rasenshuriken(layers, self.x, self.y, self.radius, animation,
                                emergence=min(1.0, self.emergence + self.frame / 14.0),
                                thrown=True, throw_frame=self.frame,
-                               spin_phase=self.start_phase + self.frame * 0.42)
+                               spin_phase=self.start_phase + self.frame * SHURIKEN_SPIN_PEAK)
         else:
             draw_rasengan(layers, self.x, self.y, self.radius, animation)
 

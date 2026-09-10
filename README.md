@@ -15,7 +15,7 @@ Use `venv/bin/python` in place of `python` if using the repository's existing vi
 ## Effects and controls
 
 - The blue Rasengan has layered rotating currents, a luminous centre, and a soft halo. Its size follows your hand's distance from the camera and grows smoothly while charging.
-- After roughly 2.5 seconds, squeeze for four consecutive detections to release four white wind blades. Their growth eases into place and their rotation accelerates smoothly.
+- After roughly 2.5 seconds, squeeze for four consecutive detections to release four white wind blades. Their growth eases into place and their rotation accelerates to 35 revolutions per second. At full charge, a continuous white wind blur replaces the distinct blades to avoid a slow or frozen appearance on camera.
 - Open your hand and swing for two consecutive fast detections to throw. Faster swings launch faster projectiles. Reacquiring a lost hand does not count as a throw.
 - Thrown effects retain their animation and leave fading wakes. A Rasenshuriken's fuse shortens near the image boundary so it detonates on screen, followed by a fading wind splash.
 

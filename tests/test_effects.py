@@ -33,7 +33,20 @@ class EffectsTests(unittest.TestCase):
         phases = [FX.shuriken_phase(t, t) for t in (13.99, 14, 14.01, 15)]
         self.assertAlmostEqual((phases[1] - phases[0]) / 0.01,
                                (phases[2] - phases[1]) / 0.01, places=3)
-        self.assertAlmostEqual(phases[3] - phases[1], 0.384)
+        self.assertAlmostEqual(phases[3] - phases[1], math.tau * 35 / 30)
+
+    def test_full_speed_blur_fills_gaps_at_every_phase(self):
+        # At mid-blade radius, a fast full-turn exposure must illuminate nearly
+        # every direction, rather than showing four isolated frozen blades.
+        angles = np.linspace(0, math.tau, 180, endpoint=False)
+        xs = (160 + 65 * np.cos(angles)).astype(int)
+        ys = (120 + 65 * np.sin(angles)).astype(int)
+        for phase in (0, 0.4, 1.1):
+            self.layers.reset()
+            FX.draw_rasenshuriken(self.layers, 160, 120, 24, 30,
+                                  energize_frame=30, spin_phase=phase)
+            brightness = self.layers.sharp[ys, xs].mean(axis=1)
+            self.assertGreater(np.mean(brightness > 45), 0.95)
 
     def test_throw_preserves_starting_phase_and_emergence(self):
         blast = FX.JutsuBlast(160, 120, 1, 0, 'rasenshuriken',
