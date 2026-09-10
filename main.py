@@ -21,6 +21,7 @@ Press 'r' to drop the jutsu and reset the sequence. Press 'q' or ESC to quit.
 """
 import math
 import sys
+import time
 
 import cv2
 import mediapipe as mp
@@ -43,7 +44,7 @@ CHARGE_DECAY = 2.0         # charge bled off per frame while no hand is visible
 DROP_AFTER_LOST_FRAMES = 45  # jutsu fizzles out if your hands stay gone this long
 
 ARM_FRAMES = 10            # grace period so the last seal's motion can't insta-throw
-THROW_SPEED_MIN = 0.055    # normalized frame-to-frame palm speed that counts as a throw
+THROW_SPEED_MIN = 0.055    # fraction of longest frame dimension per 30 Hz tick
 
 SQUEEZE_RATIO = 1.55       # grip_ratio below this counts as squeezing (a light curl)
 SQUEEZE_HOLD_FRAMES = 4    # debounce, so one noisy frame can't convert the jutsu
@@ -75,7 +76,9 @@ def fresh_jutsu():
         "lost_frames": 0,
         "squeeze_frames": 0,
         "emergence": 0.0,   # 0->1 as the wind chakra expands out of the sphere
-        "energize_frame": 0,  # frames since Rasenshuriken formation (for exponential spin)
+        "energize_frame": 0,  # 30 Hz animation ticks since wind formation
+        "palm_size": 64.0,
+        "throw_frames": 0,
     }
 
 
@@ -107,8 +110,13 @@ def match_hands_to_slots(slots, detections):
     return assigned
 
 
-def jutsu_radius(charge):
-    return BASE_RADIUS + charge * RADIUS_PER_CHARGE
+def jutsu_radius(charge, palm_size=64.0):
+    # Ease charging and follow hand depth without allowing extreme close-ups
+    # to cover the entire camera image.
+    fraction = min(1.0, max(0.0, charge / MAX_CHARGE))
+    eased = fraction * fraction * (3.0 - 2.0 * fraction)
+    hand_scale = min(1.65, max(0.65, palm_size / 64.0))
+    return (BASE_RADIUS + MAX_CHARGE * RADIUS_PER_CHARGE * eased) * hand_scale
 
 
 def draw_hud(frame, jutsu, tracker, live_match, trained, grip=None, frame_idx=0):
@@ -201,6 +209,8 @@ def main():
     projectiles = []
 
     frame_idx = 0
+    animation_frame = 0.0
+    last_frame_time = None
     connections = mp_hands.HAND_CONNECTIONS
     layers = None
 
@@ -208,6 +218,10 @@ def main():
         ok, frame = cap.read()
         if not ok:
             break
+        now = time.monotonic()
+        step = 1.0 if last_frame_time is None else min(3.0, max(0.01, (now - last_frame_time) * 30))
+        last_frame_time = now
+        animation_frame += step
         frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
         if layers is None:
@@ -240,7 +254,8 @@ def main():
                 continue
 
             cx, cy, lm = hit
-            active[i] = (cx, cy, slot["last_pos"], lm)
+            previous = slot["last_pos"] if slot["missing_frames"] == 0 else None
+            active[i] = (cx, cy, previous, lm)
             slot["missing_frames"] = 0
             slot["last_pos"] = (cx, cy)
 
@@ -256,21 +271,25 @@ def main():
                 jutsu.update({"state": RASENGAN, "pos": pos, "charge": 0.0,
                               "slot": anchor, "age": 0, "lost_frames": 0,
                               "squeeze_frames": 0, "emergence": 0.0})
+                if anchor is not None:
+                    jutsu["palm_size"] = G.palm_size_pixels(active[anchor][3], w, h)
                 recognizer.reset()
 
         # --- holding a jutsu -------------------------------------------
         elif jutsu["state"] != IDLE:
-            jutsu["age"] += 1
+            jutsu["age"] += step
 
             # Stay on the hand it was formed in; fall back to any live hand.
             hand = active.get(jutsu["slot"])
             if hand is None and active:
                 jutsu["slot"] = next(iter(active))
-                hand = active[jutsu["slot"]]
+                cx, cy, _, lm = active[jutsu["slot"]]
+                hand = (cx, cy, None, lm)
 
             if hand is None:
-                jutsu["lost_frames"] += 1
-                jutsu["charge"] = max(0.0, jutsu["charge"] - CHARGE_DECAY)
+                jutsu["throw_frames"] = 0
+                jutsu["lost_frames"] += step
+                jutsu["charge"] = max(0.0, jutsu["charge"] - CHARGE_DECAY * step)
                 if jutsu["lost_frames"] > DROP_AFTER_LOST_FRAMES:
                     jutsu = fresh_jutsu()
                     tracker.reset()
@@ -280,21 +299,28 @@ def main():
                 grip = G.grip_ratio(lm)
 
                 px, py = jutsu["pos"]
-                jutsu["pos"] = (px + (cx - px) * ANCHOR_EMA, py + (cy - py) * ANCHOR_EMA)
+                follow = 1.0 - (1.0 - ANCHOR_EMA) ** step
+                jutsu["pos"] = (px + (cx - px) * follow, py + (cy - py) * follow)
+                measured_size = G.palm_size_pixels(lm, w, h)
+                jutsu["palm_size"] += (measured_size - jutsu["palm_size"]) * (1.0 - 0.85 ** step)
 
-                speed = math.hypot(cx - prev_pos[0], cy - prev_pos[1]) if prev_pos else 0.0
-                if jutsu["age"] > ARM_FRAMES and speed > THROW_SPEED_MIN and prev_pos:
-                    vx, vy = cx - prev_pos[0], cy - prev_pos[1]
-                    n = math.hypot(vx, vy) + 1e-6
+                dx, dy, speed = G.throw_motion((cx, cy), prev_pos, w, h, step)
+                throwing = (jutsu["age"] > ARM_FRAMES and speed > THROW_SPEED_MIN
+                            and grip is not None and grip >= SQUEEZE_RATIO)
+                jutsu["throw_frames"] = jutsu["throw_frames"] + 1 if throwing else 0
+                if jutsu["throw_frames"] >= 2:
                     ox, oy = jutsu["pos"]
                     projectiles.append(FX.JutsuBlast(
-                        int(ox * w), int(oy * h), vx / n, vy / n, jutsu["state"],
-                        speed=28, radius=int(jutsu_radius(jutsu["charge"]))))
+                        int(ox * w), int(oy * h), dx, dy, jutsu["state"],
+                        speed=min(42.0, max(20.0, speed * max(w, h) * 0.8)),
+                        radius=jutsu_radius(jutsu["charge"], jutsu["palm_size"]),
+                        bounds=(w, h), animation_frame=animation_frame,
+                        energize_frame=jutsu["energize_frame"], emergence=jutsu["emergence"]))
                     jutsu = fresh_jutsu()
                     tracker.reset()
                 else:
                     if jutsu["state"] == RASENGAN:
-                        jutsu["charge"] = min(MAX_CHARGE, jutsu["charge"] + CHARGE_PER_FRAME)
+                        jutsu["charge"] = min(MAX_CHARGE, jutsu["charge"] + CHARGE_PER_FRAME * step)
                         # Squeeze converts it, but only once it's fully charged.
                         # It latches: opening your hand afterwards keeps the
                         # Rasenshuriken so you can open up to throw it.
@@ -305,8 +331,8 @@ def main():
                         else:
                             jutsu["squeeze_frames"] = 0
                     if jutsu["state"] == RASENSHURIKEN:
-                        jutsu["emergence"] = min(1.0, jutsu["emergence"] + EMERGENCE_PER_FRAME)
-                        jutsu["energize_frame"] += 1
+                        jutsu["emergence"] = min(1.0, jutsu["emergence"] + EMERGENCE_PER_FRAME * step)
+                        jutsu["energize_frame"] += step
                     else:
                         jutsu["energize_frame"] = 0
                     color = FX.RASENSHURIKEN_COLOR if jutsu["state"] == RASENSHURIKEN else FX.RASENGAN_COLOR
@@ -314,28 +340,18 @@ def main():
 
         if jutsu["state"] != IDLE and jutsu["pos"] is not None:
             ox, oy = int(jutsu["pos"][0] * w), int(jutsu["pos"][1] * h)
-            radius = jutsu_radius(jutsu["charge"])
+            radius = jutsu_radius(jutsu["charge"], jutsu["palm_size"])
             if jutsu["state"] == RASENSHURIKEN:
-                FX.draw_rasenshuriken(layers, ox, oy, radius, frame_idx,
+                FX.draw_rasenshuriken(layers, ox, oy, radius, animation_frame,
                                       emergence=jutsu["emergence"],
                                       energize_frame=jutsu["energize_frame"])
             else:
-                FX.draw_rasengan(layers, ox, oy, radius, frame_idx,
+                FX.draw_rasengan(layers, ox, oy, radius, animation_frame,
                                  charge_frac=jutsu["charge"] / MAX_CHARGE)
 
         aura.update_and_draw(layers)
 
-        next_projectiles = []
-        for p in projectiles:
-            p.update()
-            if p.offscreen(w, h):
-                if getattr(p, "detonates", False) and p.life <= 0:
-                    next_projectiles.append(FX.WindDome(p.x, p.y))
-                    next_projectiles.append(FX.WindSplash(p.x, p.y))
-                continue
-            p.draw(layers)
-            next_projectiles.append(p)
-        projectiles = next_projectiles
+        projectiles = FX.advance_projectiles(projectiles, layers, w, h, step)
 
         frame = layers.composite(frame)
 
@@ -350,6 +366,7 @@ def main():
             slots = [fresh_slot() for _ in range(MAX_HANDS_TRACKED)]
             jutsu = fresh_jutsu()
             projectiles = []
+            aura = FX.AuraParticles()
             tracker.reset()
             if recognizer is not None:
                 recognizer.reset()

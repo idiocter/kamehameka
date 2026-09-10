@@ -24,6 +24,24 @@ def palm_center(lm):
     return sum(xs) / len(xs), sum(ys) / len(ys)
 
 
+def palm_size_pixels(lm, width, height):
+    """Wrist-to-middle-knuckle distance in the camera's pixel coordinates."""
+    return math.hypot((lm[MIDDLE_MCP].x - lm[WRIST].x) * width,
+                      (lm[MIDDLE_MCP].y - lm[WRIST].y) * height)
+
+
+def throw_motion(current, previous, width, height, step=1.0):
+    """Return pixel direction and screen-relative speed per 30 Hz tick."""
+    if previous is None:
+        return 0.0, 0.0, 0.0
+    vx = (current[0] - previous[0]) * width
+    vy = (current[1] - previous[1]) * height
+    length = math.hypot(vx, vy)
+    if length < 1e-6:
+        return 0.0, 0.0, 0.0
+    return vx / length, vy / length, length / (max(width, height) * max(step, 0.01))
+
+
 def grip_ratio(lm):
     """How open the hand is: mean fingertip distance from the palm centre,
     measured in units of palm size. Roughly 2.2 open, 1.0 in a fist.

@@ -8,6 +8,7 @@ accumulate into light rather than painting over each other.
 """
 import random
 import math
+from collections import deque
 import numpy as np
 import cv2
 
@@ -284,13 +285,13 @@ def draw_rasengan(layers, cx, cy, radius, frame_idx, charge_frac=1.0):
 
     # Different tilted great-circle currents give the orb volume. Broken arcs
     # and variable speeds keep the texture flowing rather than looking metallic.
-    phase = frame_idx * 0.085
-    for i in range(16):
+    phase = frame_idx * 0.13
+    for i in range(12):
         tilt = i * 2.39996
         start = phase * (1.0 + (i % 4) * 0.19) + i * 1.7
         theta = np.linspace(start, start + 3.8, 48)
         depth = np.sin(theta)
-        orbit = r * (0.58 + 0.025 * i)
+        orbit = r * (0.58 + 0.033 * i)
         x = orbit * np.cos(theta)
         y = orbit * depth * (0.24 + 0.035 * (i % 7))
         points = np.column_stack((cx + x * math.cos(tilt) - y * math.sin(tilt),
@@ -301,6 +302,10 @@ def draw_rasengan(layers, cx, cy, radius, frame_idx, charge_frac=1.0):
                            brightness * (0.45 + 0.45 * front))
             cv2.polylines(layers.sharp, [points[j:j + 9].astype(np.int32)],
                           False, color, max(1, int(r * 0.025)), cv2.LINE_AA)
+
+    # A compact luminous centre keeps the spherical flow legible in motion.
+    draw_soft_glow_circle(layers.soft, (cx, cy), r * 0.32,
+                          (255, 205, 130), intensity=brightness * 0.7)
 
     # Fine outer contour and small curling streams read clearly at palm size.
     cv2.circle(layers.sharp, (cx, cy), int(r),
@@ -381,9 +386,16 @@ def _filament_layout(count=FILAMENTS_PER_BLADE, seed=17):
 _FILAMENTS = _filament_layout()
 
 
+def shuriken_phase(frame_idx, energize_frame=0):
+    """Continuous angle: accelerate for 14 animation ticks, then keep that speed."""
+    age = max(0.0, energize_frame)
+    ramp = min(age, 14.0)
+    return frame_idx * 0.16 + 0.008 * ramp * ramp + 0.224 * max(0.0, age - 14.0)
+
+
 def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
                        halo=RASENSHURIKEN_HALO, velocity=None, speed=0.0,
-                       thrown=False, throw_frame=0, energize_frame=0):
+                       thrown=False, throw_frame=0, energize_frame=0, spin_phase=None):
     """Four tapered white wind blades surrounding a swirling blue chakra core.
 
     Short angular afterimages suggest speed while preserving the four-point
@@ -396,28 +408,23 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
         return
     expansion = 1.0 + (0.25 * min(1.0, max(0, throw_frame) / 12.0) if thrown else 0.0)
     core_radius = max(4.0, radius * expansion)
-    outer = core_radius * (1.0 + 3.2 * e)
+    eased = e * e * (3.0 - 2.0 * e)
+    outer = core_radius * (1.0 + 3.6 * eased)
     inner = core_radius * 0.78
-    # Integrating a bounded spin-up avoids the phase jumps of age * spin_rate.
-    age = max(0, energize_frame)
-    spin = frame_idx * 0.16 + 0.012 * min(age, 14) ** 2
-    if thrown:
-        spin += throw_frame * 0.12
-    if velocity is not None and speed > 0:
-        spin += 0.08 * math.atan2(velocity[1], velocity[0])
+    spin = shuriken_phase(frame_idx, energize_frame) if spin_phase is None else spin_phase
 
     for k in range(4):
         angle = spin + k * math.pi / 2
         # Trailing exposures belong in bloom, leaving dark gaps between points.
-        for lag, strength in ((0.18, 0.10), (0.09, 0.18)):
+        for lag, strength in ((0.30, 0.12), (0.15, 0.24)):
             trail = _blade_spine(cx, cy, angle - lag, inner, outer, _BLADE_SAMPLES)
             cv2.fillPoly(layers.soft, [_blade_polygon(trail, 1.1)],
                          _scale(halo, strength * e), cv2.LINE_AA)
         spine = _blade_spine(cx, cy, angle, inner, outer, _BLADE_SAMPLES)
         cv2.fillPoly(layers.sharp, [_blade_polygon(spine)],
-                     _scale((235, 213, 175), 0.72 * e), cv2.LINE_AA)
+                     _scale((235, 213, 175), 0.60 * e), cv2.LINE_AA)
         cv2.fillPoly(layers.sharp, [_blade_polygon(spine, 0.7)],
-                     _scale(RASENSHURIKEN_COLOR, 0.90 * e), cv2.LINE_AA)
+                     _scale(RASENSHURIKEN_COLOR, 0.78 * e), cv2.LINE_AA)
         # Flowing hairline streaks inside the luminous wind envelope.
         for seat, t_start, twist, phase, bright in _FILAMENTS[::3]:
             pts = []
@@ -428,7 +435,7 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
                 offset = seat * math.cos(phase + twist * t - frame_idx * 0.22)
                 pts.append((x + tx * width * offset, y + ty * width * offset))
             cv2.polylines(layers.sharp, [np.asarray(pts, dtype=np.int32)], False,
-                          _scale(RASENSHURIKEN_COLOR, e * (0.78 + 0.22 * bright)),
+                          _scale(RASENSHURIKEN_COLOR, e * (0.84 + 0.16 * bright)),
                           1, cv2.LINE_AA)
 
     # Broken wind arcs around the hub, not a full circular outer blade border.
@@ -442,39 +449,86 @@ def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
 
 
 class JutsuBlast:
-    """A thrown Rasengan or Rasenshuriken travelling in a straight line."""
+    """A directed chakra projectile with a fading wake and an on-screen wind fuse."""
 
-    def __init__(self, x, y, dx, dy, style, speed=28, radius=26, velocity=None):
-        self.x, self.y = x, y
-        self.dx, self.dy = dx, dy
+    def __init__(self, x, y, dx, dy, style, speed=28, radius=26, velocity=None,
+                 bounds=None, animation_frame=0, energize_frame=0, emergence=1.0):
+        self.x, self.y = float(x), float(y)
+        length = math.hypot(dx, dy)
+        self.dx, self.dy = (dx / length, dy / length) if length > 1e-6 else (1.0, 0.0)
         self.style = style
-        self.speed = speed
-        self.radius = radius
-        self.frame = 0
+        self.speed = max(1.0, float(speed))
+        self.radius = max(4.0, float(radius))
+        self.frame = 0.0
+        self.animation_frame = animation_frame
+        self.start_phase = shuriken_phase(animation_frame, energize_frame)
+        self.emergence = min(1.0, max(0.0, emergence))
         self.detonates = style == "rasenshuriken"
-        # The Rasenshuriken gets a short fuse so it goes off inside the frame
-        # instead of sailing offscreen; a plain Rasengan just flies away.
-        self.life = 16 if self.detonates else 60
-        self.velocity = velocity or (dx, dy)  # normalized or raw velocity
+        self.life = 16.0 if self.detonates else 60.0
+        self.velocity = velocity or (self.dx, self.dy)
+        self.trail = deque(maxlen=10)
+        if self.detonates and bounds is not None:
+            # Stop before the centre leaves the image, even for a fast edge throw.
+            w, h = bounds
+            margin = min(self.radius + 12, min(w, h) * 0.2)
+            distances = []
+            for pos, direction, limit in ((self.x, self.dx, w), (self.y, self.dy, h)):
+                if abs(direction) > 1e-6:
+                    edge = limit - margin if direction > 0 else margin
+                    distances.append(max(0.0, (edge - pos) / direction))
+            self.life = min(self.life, min(distances) / self.speed)
 
-    def update(self):
-        self.x += self.dx * self.speed
-        self.y += self.dy * self.speed
-        self.life -= 1
-        self.frame += 1
+    def update(self, step=1.0):
+        step = max(0.0, step)
+        travel = min(step, max(0.0, self.life))
+        self.trail.append((self.x, self.y, self.frame))
+        self.x += self.dx * self.speed * travel
+        self.y += self.dy * self.speed * travel
+        self.life -= step
+        self.frame += step
 
     def offscreen(self, w, h):
-        return self.life <= 0 or self.x < -50 or self.x > w + 50 or self.y < -50 or self.y > h + 50
+        extent = self.radius * (5.75 if self.detonates else 1.4)
+        return (self.life <= 0 or self.x < -extent or self.x > w + extent
+                or self.y < -extent or self.y > h + extent)
 
     def draw(self, layers):
-        if self.style == "rasenshuriken":
-            speed_factor = math.hypot(self.dx, self.dy) * self.speed
-            # Use the same wind silhouette in flight as in the hand.
-            draw_rasenshuriken(layers, self.x, self.y, self.radius, self.frame,
-                               velocity=self.velocity, speed=speed_factor,
-                               thrown=True, throw_frame=self.frame)
+        color = RASENSHURIKEN_HALO if self.detonates else RASENGAN_COLOR
+        for x, y, age in self.trail:
+            fade = max(0.0, 1.0 - (self.frame - age) / 10.0)
+            draw_soft_glow_circle(layers.soft, (x, y), self.radius * (0.25 + 0.5 * fade),
+                                  color, intensity=fade * 0.35, rings=3)
+        if len(self.trail) > 1:
+            points = np.array([(x, y) for x, y, _ in self.trail] + [(self.x, self.y)],
+                              dtype=np.int32)
+            cv2.polylines(layers.soft, [points], False, _scale(color, 0.3),
+                          max(1, int(self.radius * 0.16)), cv2.LINE_AA)
+        animation = self.animation_frame + self.frame
+        if self.detonates:
+            draw_rasenshuriken(layers, self.x, self.y, self.radius, animation,
+                               emergence=min(1.0, self.emergence + self.frame / 14.0),
+                               thrown=True, throw_frame=self.frame,
+                               spin_phase=self.start_phase + self.frame * 0.42)
         else:
-            draw_rasengan(layers, self.x, self.y, self.radius, self.frame)
+            draw_rasengan(layers, self.x, self.y, self.radius, animation)
+
+
+def advance_projectiles(projectiles, layers, width, height, step=1.0):
+    """Advance flight -> wind dome -> splash, drawing each active stage once."""
+    alive = []
+    for effect in projectiles:
+        effect.update(step)
+        if effect.offscreen(width, height):
+            if isinstance(effect, JutsuBlast) and effect.detonates and effect.life <= 0:
+                alive.append(WindDome(effect.x, effect.y,
+                                      max_radius=min(260, min(width, height) * 0.46)))
+            elif isinstance(effect, WindDome) and effect.finished:
+                alive.append(WindSplash(effect.x, effect.y,
+                                        max_radius=effect.max_radius * 1.15))
+            continue
+        effect.draw(layers)
+        alive.append(effect)
+    return alive
 
 
 class WindDome:
@@ -489,8 +543,8 @@ class WindDome:
         self.needles = [(random.uniform(0, 2 * math.pi), random.uniform(0.7, 1.15)) for _ in range(26)]
         self._finished = False
 
-    def update(self):
-        self.life -= 1
+    def update(self, step=1.0):
+        self.life = max(0.0, self.life - max(0.0, step))
         if self.life <= 0:
             self._finished = True
 
@@ -498,9 +552,19 @@ class WindDome:
         return self.life <= 0
 
     def draw(self, layers):
+        if self.life <= 0:
+            return
         t = 1.0 - self.life / self.max_life           # 0 -> 1 over the blast
         radius = self.max_radius * (1 - (1 - t) ** 2)  # bursts out fast, then eases
         fade = (self.life / self.max_life) ** 1.5
+        # Latitude arcs and a broad luminous shell give the burst volume.
+        draw_soft_glow_circle(layers.soft, (self.x, self.y), radius,
+                              RASENSHURIKEN_HALO, intensity=fade * 0.65)
+        for squash, tilt in ((0.32, 20), (0.58, -35), (0.80, 65)):
+            cv2.ellipse(layers.sharp, (self.x, self.y),
+                        (max(2, int(radius)), max(1, int(radius * squash))),
+                        tilt + t * 80, 0, 300, _scale(self.color, fade * 0.55),
+                        max(1, int(2 * fade)), cv2.LINE_AA)
 
         cv2.circle(layers.sharp, (self.x, self.y), max(2, int(radius)), _scale(self.color, fade),
                    max(1, int(6 * fade)), lineType=cv2.LINE_AA)
@@ -534,15 +598,17 @@ class WindSplash:
         self.color = color
         self.needles = [(random.uniform(0, 2 * math.pi), random.uniform(0.8, 1.3)) for _ in range(32)]
 
-    def update(self):
-        self.life -= 1
+    def update(self, step=1.0):
+        self.life = max(0.0, self.life - max(0.0, step))
 
     def offscreen(self, w, h):
         return self.life <= 0
 
     def draw(self, layers):
+        if self.life <= 0:
+            return
         t = 1.0 - self.life / self.max_life           # 1 -> 0 over the splash
-        radius = self.max_radius * t
+        radius = self.max_radius * (0.65 + 0.35 * t)
         fade = (self.life / self.max_life) ** 0.7
 
         # Radiating blades
