@@ -121,8 +121,6 @@ class GlowLayers:
 
 
 _SPHERE_CACHE = {}
-_SPHERE_NORMAL_CACHE = {}
-_SPHERE_SPECULAR_CACHE = {}
 
 
 def _sphere_patch(radius):
@@ -182,39 +180,6 @@ def _sphere_patch(radius):
         'radius': r,
     }
     _SPHERE_CACHE[r] = patch
-    return patch
-
-
-def _sphere_patch_fast(radius):
-    """Lightweight version for projectiles - just color + alpha."""
-    r = max(3, int(radius))
-    cached = _SPHERE_SPECULAR_CACHE.get(r)
-    if cached is not None:
-        return cached
-
-    yy, xx = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
-    d = np.hypot(xx, yy) / r
-    valid = d <= 1.0
-
-    color_idx = np.clip(d ** 1.5 * 0.85 * 255, 0, 255).astype(np.uint8)
-    base_color = _CHAKRA_LUT[color_idx]
-
-    alpha = np.clip((1.08 - d) / 0.22, 0.0, 1.0)
-    alpha *= (0.62 + 0.38 * np.clip(1.0 - d, 0.0, 1.0))
-
-    # Simple specular highlight
-    z = np.sqrt(np.maximum(0.0, 1.0 - d * d))
-    specular = np.power(np.maximum(0.0, z * 0.98), 32.0)
-    specular = np.where(valid, specular, 0.0)
-
-    patch = {
-        'color': base_color,
-        'alpha': alpha[..., None],
-        'specular': specular[..., None],
-        'valid': valid[..., None],
-        'radius': r,
-    }
-    _SPHERE_SPECULAR_CACHE[r] = patch
     return patch
 
 
@@ -303,80 +268,59 @@ class AuraParticles:
 
 
 def draw_rasengan(layers, cx, cy, radius, frame_idx, charge_frac=1.0):
-    """3D Rasengan with dynamic lighting, rotating surface detail, and depth."""
+    """Blue chakra sphere with interwoven currents projected over its surface."""
     cx, cy = int(cx), int(cy)
-    pulse = 1.0 + 0.05 * math.sin(frame_idx * 0.45)
-    r = max(4.0, radius * pulse)
-    brightness = 0.78 + 0.30 * charge_frac
+    charge = min(1.0, max(0.0, charge_frac))
+    r = max(4.0, radius * (1.0 + 0.018 * math.sin(frame_idx * 0.23)))
+    brightness = 0.65 + 0.35 * charge
+    draw_soft_glow_circle(layers.soft, (cx, cy), r * 1.4,
+                          (255, 135, 45), intensity=0.85 * brightness)
 
-    # --- 1. Atmospheric bloom (soft layer) ---
-    glow_r = max(2, int(r * 1.35))
-    cv2.circle(layers.soft, (cx, cy), glow_r,
-               _scale(chakra_color(0.28), 0.75 * brightness),
-               max(2, int(r * 0.75)), lineType=cv2.LINE_AA)
-
-    # Outer pulse ring for energy feel
-    pulse_phase = frame_idx * 0.15
-    pulse_r = int(r * 1.15 + 2.0 * math.sin(pulse_phase))
-    if pulse_r > 2:
-        cv2.circle(layers.soft, (cx, cy), pulse_r,
-                   _scale(chakra_color(0.45), 0.35 * brightness * abs(math.sin(pulse_phase))),
-                   1, lineType=cv2.LINE_AA)
-
-    # --- 2. Core sphere with 3D shading (sharp layer) ---
+    # Scale only this contribution; never multiply other effects in its bounds.
     sphere = _sphere_patch(r)
-    _add_patch(layers.sharp, sphere, cx, cy)
+    body = (sphere['color'] * sphere['alpha'] * 0.65
+            + sphere['rim'] * np.array((90, 65, 25), dtype=np.float32))
+    _add_patch(layers.sharp, body * brightness, cx, cy)
 
-    # Brightness modulation applied via scaling the patch contribution
-    if brightness != 1.0:
-        r_int = sphere['radius']
-        ph, pw = r_int * 2 + 1, r_int * 2 + 1
-        y0, x0 = cy - r_int, cx - r_int
-        dy0, dx0 = max(0, y0), max(0, x0)
-        dy1, dx1 = min(layers.sharp.shape[0], y0 + ph), min(layers.sharp.shape[1], x0 + pw)
-        if dy0 < dy1 and dx0 < dx1:
-            sy0, sx0 = dy0 - y0, dx0 - x0
-            sy1, sx1 = sy0 + (dy1 - dy0), sx0 + (dx1 - dx0)
-            layers.sharp[dy0:dy1, dx0:dx1] *= brightness
+    # Different tilted great-circle currents give the orb volume. Broken arcs
+    # and variable speeds keep the texture flowing rather than looking metallic.
+    phase = frame_idx * 0.085
+    for i in range(16):
+        tilt = i * 2.39996
+        start = phase * (1.0 + (i % 4) * 0.19) + i * 1.7
+        theta = np.linspace(start, start + 3.8, 48)
+        depth = np.sin(theta)
+        orbit = r * (0.58 + 0.025 * i)
+        x = orbit * np.cos(theta)
+        y = orbit * depth * (0.24 + 0.035 * (i % 7))
+        points = np.column_stack((cx + x * math.cos(tilt) - y * math.sin(tilt),
+                                  cy + x * math.sin(tilt) + y * math.cos(tilt)))
+        for j in range(0, len(points) - 1, 8):
+            front = 0.5 + 0.5 * float(depth[j])
+            color = _scale((255, 175 + 55 * front, 90 + 100 * front),
+                           brightness * (0.45 + 0.45 * front))
+            cv2.polylines(layers.sharp, [points[j:j + 9].astype(np.int32)],
+                          False, color, max(1, int(r * 0.025)), cv2.LINE_AA)
 
-    # --- 3. Rotating surface currents (fewer, optimized) ---
-    # Precompute animation parameters
-    t = frame_idx * 0.02
+    # Fine outer contour and small curling streams read clearly at palm size.
+    cv2.circle(layers.sharp, (cx, cy), int(r),
+               _scale((255, 210, 130), 0.7 * brightness), 1, cv2.LINE_AA)
     for i in range(3):
-        rr = max(2, int(r * (0.50 + 0.18 * i)))
-        squash = 0.15 + 0.35 * abs(math.sin(t * (0.7 + 0.15 * i) + i * 1.3))
-        tilt = (frame_idx * (6.0 + 4.5 * i) + i * 53) % 360
-        start = (frame_idx * (9.0 - 2.0 * i)) % 360
-        color = _scale(chakra_color(0.55 + 0.1 * i), 0.95 * brightness)
-        thickness = max(1, int(r * 0.06))
-        cv2.ellipse(layers.sharp, (cx, cy), (rr, max(2, int(rr * squash))), tilt,
-                    start, start + 220, color, thickness, lineType=cv2.LINE_AA)
-
-    # --- 4. Specular highlight orbit (simulates 3D rotation) ---
-    # Two highlights orbiting on different latitudes
-    for i in range(2):
-        lat = 0.35 + 0.25 * i  # Latitude on sphere
-        lon_speed = 0.28 + 0.07 * i
-        a = frame_idx * lon_speed + i * math.pi
-        # Project 3D sphere point to 2D
-        hx = cx + math.cos(a) * r * math.sqrt(1.0 - lat * lat) * 0.95
-        hy = cy + math.sin(a) * r * math.sqrt(1.0 - lat * lat) * 0.7 + lat * r * 0.3
-        hl_r = max(1, int(r * 0.07))
-        cv2.circle(layers.sharp, (int(hx), int(hy)), hl_r,
-                   _scale(chakra_color(1.0), 1.2 * brightness), -1, lineType=cv2.LINE_AA)
-
-    # --- 5. Subsurface scattering hint (inner glow bleed) ---
-    inner_r = max(1, int(r * 0.35))
-    cv2.circle(layers.soft, (cx, cy), inner_r,
-               _scale(chakra_color(0.15), 0.4 * brightness), -1, lineType=cv2.LINE_AA)
+        theta = np.linspace(0, 4.8, 45)
+        spiral_r = r * (0.08 + 0.13 * theta)
+        angle = theta - phase * 1.7 + i * math.tau / 3
+        points = np.column_stack((cx + spiral_r * np.cos(angle),
+                                  cy + spiral_r * np.sin(angle) * 0.8))
+        cv2.polylines(layers.sharp, [points.astype(np.int32)], False,
+                      _scale((255, 225, 165), 0.85 * brightness), 1, cv2.LINE_AA)
 
 
-BLADE_SWEEP = -0.40   # radians the centreline curls back over the blade's length
+BLADE_SWEEP = -0.16   # radians the centreline curls back over the blade's length
 # Peak half-width as a fraction of blade length. Roughly half the angular space
 # has to stay empty or the four petals merge into a flower and the gaps - which
 # are what make it read as a shuriken - disappear.
-BLADE_WIDTH = 0.20
-_WIDTH_FRONT = 0.45   # exponents of the width profile: t**FRONT * (1-t)**BACK
+BLADE_WIDTH = 0.18
+_WIDTH_FRONT = 0.18   # exponents of the width profile: t**FRONT * (1-t)**BACK
 _WIDTH_BACK = 1.0     # higher = finer point at the tip
 # Peak of t**a * (1-t)**b sits at t = a/(a+b); divide through by its value there
 # so BLADE_WIDTH means what it says.
@@ -440,209 +384,61 @@ _FILAMENTS = _filament_layout()
 def draw_rasenshuriken(layers, cx, cy, radius, frame_idx, emergence=1.0,
                        halo=RASENSHURIKEN_HALO, velocity=None, speed=0.0,
                        thrown=False, throw_frame=0, energize_frame=0):
-    """A compact chakra core inside an enormous four-pointed wind shuriken.
+    """Four tapered white wind blades surrounding a swirling blue chakra core.
 
-    The four points are not solid blades. Each is a dense bundle of razor-thin
-    filaments twisting around the blade axis, so the silhouette reads as sharp and
-    aerodynamic while the substance stays fibrous and distributed - a solid fill
-    looks like sheet metal, which is the one thing this technique is not.
-
-    Colour runs outward along the chakra ramp: the core stays deep saturated blue
-    while the fastest outer filaments carry the near-white highlights.
-
-    `emergence` (0..1) drives the transformation - the wind chakra expands out of
-    the sphere rather than the sphere simply being scaled up.
-
-    `velocity` and `speed` influence filament twist: a fast throw winds the
-    filaments into a more dynamic, spiralled appearance.
-
-    When `thrown=True`, the shuriken expands dramatically and spins at god-like speed.
-    `throw_frame` tracks frames since throw for growth/animation.
-
-    When `energize_frame > 0` (held Rasenshuriken), rotation speed increases
-    exponentially from base to 50 RPS as emergence goes 0->1.
+    Short angular afterimages suggest speed while preserving the four-point
+    silhouette. Throw growth is restrained so the core and tips stay readable.
     """
     cx, cy = int(cx), int(cy)
     e = min(1.0, max(0.0, emergence))
-
-    # --- Thrown mode: massive expansion + god-tier rotation ---
+    if e == 0.0:
+        draw_rasengan(layers, cx, cy, radius, frame_idx)
+        return
+    expansion = 1.0 + (0.25 * min(1.0, max(0, throw_frame) / 12.0) if thrown else 0.0)
+    core_radius = max(4.0, radius * expansion)
+    outer = core_radius * (1.0 + 3.2 * e)
+    inner = core_radius * 0.78
+    # Integrating a bounded spin-up avoids the phase jumps of age * spin_rate.
+    age = max(0, energize_frame)
+    spin = frame_idx * 0.16 + 0.012 * min(age, 14) ** 2
     if thrown:
-        # Rapid expansion: grows to 4x size over ~12 frames
-        growth = min(1.0, throw_frame / 12.0)
-        expansion = 1.0 + growth * 3.5  # 1x -> 4.5x
-        # 50 rotations/second at 30 FPS = 1.667 rotations/frame = 10.47 rad/frame
-        # 4-blade symmetry: visual repeat every π/2, so this = 6.67 visual cycles/frame
-        SPIN_PER_FRAME = 10.47  # radians = 50 RPS @ 30 FPS
-        spin = throw_frame * SPIN_PER_FRAME
-        # Filaments spin even faster for insane blur effect
-        filament_spin_mult = 20.0
-        blade_len = radius * expansion * (1.0 + 3.5 * e)
-        inner = radius * expansion * 1.02
-        # Intensity ramps up then sustains
-        intensity = 0.7 + 0.3 * min(1.0, throw_frame / 8.0)
-    elif energize_frame > 0:
-        # --- Energizing mode (held): exponential spin-up to 50 RPS ---
-        # emergence goes 0->1 over ~14 frames (EMERGENCE_PER_FRAME = 1/14)
-        # Spin starts slow, accelerates exponentially to 50 RPS at full emergence
-        # Base: 2 RPS = 0.42 rad/frame, Peak: 50 RPS = 10.47 rad/frame
-        # Exponential curve: spin_rate = base * (peak/base)^emergence
-        base_rps = 2.0
-        peak_rps = 50.0
-        base_spin = base_rps * 2.0 * math.pi / 30.0  # rad/frame
-        peak_spin = peak_rps * 2.0 * math.pi / 30.0  # rad/frame
-        # Exponential interpolation
-        spin_rate = base_spin * math.exp(math.log(peak_spin / base_spin) * e)
-        spin = energize_frame * spin_rate
-        # Filaments also accelerate exponentially
-        filament_spin_mult = 1.0 + 19.0 * (e ** 2)  # 1x -> 20x
-        expansion = 1.0 + 0.5 * e  # Slight expansion during energize (1x -> 1.5x)
-        blade_len = radius * expansion * (1.0 + 3.5 * e)
-        inner = radius * expansion * 1.02
-        intensity = 0.5 + 0.5 * e  # Brightness ramps with emergence
-    else:
-        # Normal held mode (shouldn't happen for Rasenshuriken, but fallback)
-        spin = frame_idx * 0.09
-        expansion = 1.0
-        filament_spin_mult = 1.0
-        blade_len = radius * (1.0 + 3.5 * e)
-        inner = radius * 1.02
-        intensity = 1.0
-
-    chunk = max(1, _BLADE_SAMPLES // 3)
-
-    # --- velocity-dependent filament twist ---
-    twist_offset = 0.0
-    if velocity is not None and speed > 0.0:
-        vx, vy = velocity
-        v_norm = math.hypot(vx, vy) + 1e-6
-        twist_factor = (vy / v_norm) * min(1.0, speed / 30.0)
-        twist_offset = twist_factor * 0.15
+        spin += throw_frame * 0.12
+    if velocity is not None and speed > 0:
+        spin += 0.08 * math.atan2(velocity[1], velocity[0])
 
     for k in range(4):
-        angle = spin + k * (math.pi / 2)
-        spine = _blade_spine(cx, cy, angle, inner, blade_len, samples=_BLADE_SAMPLES)
-
-        # Volumetric glow - scales with expansion
-        cv2.fillPoly(layers.soft, [_blade_polygon(spine, scale=1.15)],
-                     _scale(halo, 0.28 * e * intensity), lineType=cv2.LINE_AA)
-
-        for seat, t_start, twist, phase, bright in _FILAMENTS:
+        angle = spin + k * math.pi / 2
+        # Trailing exposures belong in bloom, leaving dark gaps between points.
+        for lag, strength in ((0.18, 0.10), (0.09, 0.18)):
+            trail = _blade_spine(cx, cy, angle - lag, inner, outer, _BLADE_SAMPLES)
+            cv2.fillPoly(layers.soft, [_blade_polygon(trail, 1.1)],
+                         _scale(halo, strength * e), cv2.LINE_AA)
+        spine = _blade_spine(cx, cy, angle, inner, outer, _BLADE_SAMPLES)
+        cv2.fillPoly(layers.sharp, [_blade_polygon(spine)],
+                     _scale((235, 213, 175), 0.72 * e), cv2.LINE_AA)
+        cv2.fillPoly(layers.sharp, [_blade_polygon(spine, 0.7)],
+                     _scale(RASENSHURIKEN_COLOR, 0.90 * e), cv2.LINE_AA)
+        # Flowing hairline streaks inside the luminous wind envelope.
+        for seat, t_start, twist, phase, bright in _FILAMENTS[::3]:
             pts = []
-            for i, (x, y, tx, ty, w) in enumerate(spine):
+            for i, (x, y, tx, ty, width) in enumerate(spine):
                 t = i / _BLADE_SAMPLES
                 if t < t_start:
                     continue
-                # Strands spiral around blade axis - MUCH faster when thrown
-                off = seat * math.cos(phase + (twist * filament_spin_mult + twist_offset) * t + frame_idx * 0.11 * filament_spin_mult)
-                pts.append((x + tx * w * off, y + ty * w * off))
-            if len(pts) < 3:
-                continue
-            arr = np.array([[int(px), int(py)] for px, py in pts], dtype=np.int32)
+                offset = seat * math.cos(phase + twist * t - frame_idx * 0.22)
+                pts.append((x + tx * width * offset, y + ty * width * offset))
+            cv2.polylines(layers.sharp, [np.asarray(pts, dtype=np.int32)], False,
+                          _scale(RASENSHURIKEN_COLOR, e * (0.78 + 0.22 * bright)),
+                          1, cv2.LINE_AA)
 
-            # Drawn in radial chunks so colour climbs the ramp along the strand.
-            for c0 in range(0, len(arr) - 1, chunk):
-                seg = arr[c0:c0 + chunk + 1]
-                if len(seg) < 2:
-                    continue
-                t_mid = t_start + (c0 + chunk * 0.5) / _BLADE_SAMPLES
-                shade = chakra_color(min(1.0, 0.28 + t_mid * 0.85))
-                cv2.polylines(layers.sharp, [seg], False,
-                              _scale(shade, bright * (0.5 + 0.5 * e) * intensity), 1, lineType=cv2.LINE_AA)
-
-        # Microscopic cutting structures - also spin faster when thrown
-        for j, (seat, _t0, _tw, phase, _br) in enumerate(_FILAMENTS[::3]):
-            i = 6 + (j * 3) % max(1, _BLADE_SAMPLES - 7)
-            sx, sy, stx, sty, sw = spine[i]
-            off = seat * math.cos(phase + frame_idx * 0.11 * filament_spin_mult)
-            px, py = sx + stx * sw * off, sy + sty * sw * off
-            rx, ry = sty, -stx
-            ln = sw * 0.55 * e * intensity
-            cv2.line(layers.sharp,
-                     (int(px - rx * ln), int(py - ry * ln)),
-                     (int(px + rx * ln), int(py + ry * ln)),
-                     _scale(chakra_color(0.97), 0.55 * e * intensity), 1, lineType=cv2.LINE_AA)
-
-    # Outer boundary disc - expands with shuriken
-    cv2.circle(layers.sharp, (cx, cy), max(2, int(blade_len * 0.99)),
-               _scale(halo, 0.18 * e * intensity), 1, lineType=cv2.LINE_AA)
-
-    # Central sphere - also expands when thrown
-    core_radius = radius * expansion if thrown else radius
-    draw_rasengan(layers, cx, cy, core_radius, frame_idx, charge_frac=1.0)
-
-    # --- velocity-dependent filament twist ---
-    twist_offset = 0.0
-    if velocity is not None and speed > 0.0:
-        # Normalize velocity vector; faster speed = more twist
-        vx, vy = velocity
-        v_norm = math.hypot(vx, vy) + 1e-6
-        # Map speed to a twist factor in [-0.2, 0.2]; sign gives handedness
-        twist_factor = (vy / v_norm) * min(1.0, speed / 30.0)
-        twist_offset = twist_factor * 0.15  # radians max offset
-
-    blade_len = radius * (1.0 + 3.5 * e)
-    # Blades start at the sphere's surface, not inside it - filaments crossing
-    # the core would additively wash the deep blue out to white.
-    inner = radius * 1.02
-    chunk = max(1, _BLADE_SAMPLES // 3)
-
-    for k in range(4):
-        angle = spin + k * (math.pi / 2)
-        spine = _blade_spine(cx, cy, angle, inner, blade_len, samples=_BLADE_SAMPLES)
-
-        # Volumetric glow fills the blade's envelope, giving the bundle mass
-        # without the filaments themselves ever becoming a solid surface.
-        cv2.fillPoly(layers.soft, [_blade_polygon(spine, scale=1.1)],
-                     _scale(halo, 0.22 * e), lineType=cv2.LINE_AA)
-
-        for seat, t_start, twist, phase, bright in _FILAMENTS:
-            pts = []
-            for i, (x, y, tx, ty, w) in enumerate(spine):
-                t = i / _BLADE_SAMPLES
-                if t < t_start:
-                    continue
-                # Strands spiral around the blade axis, so they cross over one
-                # another instead of lying in flat parallel stripes.
-                off = seat * math.cos(phase + (twist + twist_offset) * t + frame_idx * 0.11)
-                pts.append((x + tx * w * off, y + ty * w * off))
-            if len(pts) < 3:
-                continue
-            arr = np.array([[int(px), int(py)] for px, py in pts], dtype=np.int32)
-
-            # Drawn in radial chunks so colour climbs the ramp along the strand.
-            for c0 in range(0, len(arr) - 1, chunk):
-                seg = arr[c0:c0 + chunk + 1]
-                if len(seg) < 2:
-                    continue
-                t_mid = t_start + (c0 + chunk * 0.5) / _BLADE_SAMPLES
-                shade = chakra_color(min(1.0, 0.28 + t_mid * 0.85))
-                cv2.polylines(layers.sharp, [seg], False,
-                              _scale(shade, bright * (0.5 + 0.5 * e)), 1, lineType=cv2.LINE_AA)
-
-        # Microscopic cutting structures: tiny slivers lying *along* the blade,
-        # embedded inside the bundle. Anything angled across the blade reads as a
-        # scratch laid over the top of it rather than wind inside it.
-        for j, (seat, _t0, _tw, phase, _br) in enumerate(_FILAMENTS[::3]):
-            i = 6 + (j * 3) % max(1, _BLADE_SAMPLES - 7)
-            sx, sy, stx, sty, sw = spine[i]
-            off = seat * math.cos(phase + frame_idx * 0.11)
-            px, py = sx + stx * sw * off, sy + sty * sw * off
-            # Radial direction is the tangent rotated a quarter turn.
-            rx, ry = sty, -stx
-            ln = sw * 0.55 * e
-            cv2.line(layers.sharp,
-                     (int(px - rx * ln), int(py - ry * ln)),
-                     (int(px + rx * ln), int(py + ry * ln)),
-                     _scale(chakra_color(0.97), 0.55 * e), 1, lineType=cv2.LINE_AA)
-
-    # The disc the blades sweep through - a faint boundary only. Discrete radial
-    # ticks around it read as a clock face, so the perimeter detail lives on the
-    # blades instead.
-    cv2.circle(layers.sharp, (cx, cy), max(2, int(blade_len * 0.99)),
-               _scale(halo, 0.14 * e), 1, lineType=cv2.LINE_AA)
-
-    # The original sphere stays visibly itself at the exact centre.
-    draw_rasengan(layers, cx, cy, radius, frame_idx, charge_frac=1.0)
+    # Broken wind arcs around the hub, not a full circular outer blade border.
+    for i in range(3):
+        start = math.degrees(-frame_idx * 0.12) + i * 120
+        cv2.ellipse(layers.sharp, (cx, cy),
+                    (max(2, int(core_radius * 1.5)), max(2, int(core_radius * 0.65))),
+                    18, start, start + 85, _scale(RASENSHURIKEN_COLOR, 0.8 * e),
+                    max(1, int(core_radius * 0.04)), cv2.LINE_AA)
+    draw_rasengan(layers, cx, cy, core_radius, frame_idx)
 
 
 class JutsuBlast:
@@ -673,26 +469,12 @@ class JutsuBlast:
     def draw(self, layers):
         if self.style == "rasenshuriken":
             speed_factor = math.hypot(self.dx, self.dy) * self.speed
-            # Thrown rasenshuriken: massive expansion + god-tier rotation
+            # Use the same wind silhouette in flight as in the hand.
             draw_rasenshuriken(layers, self.x, self.y, self.radius, self.frame,
                                velocity=self.velocity, speed=speed_factor,
                                thrown=True, throw_frame=self.frame)
         else:
-            # Use fast path for projectiles - no charge frac, simpler rendering
-            cx, cy = int(self.x), int(self.y)
-            r = max(4.0, self.radius)
-            sphere = _sphere_patch_fast(r)
-            _add_patch(layers.sharp, sphere, cx, cy)
-            # Quick glow
-            cv2.circle(layers.soft, (cx, cy), int(r * 1.3),
-                       _scale(chakra_color(0.3), 0.7), max(2, int(r * 0.7)), lineType=cv2.LINE_AA)
-            # Rotation hint
-            a = self.frame * 0.3
-            for i in range(2):
-                hx = cx + math.cos(a + i * math.pi) * r * 0.7
-                hy = cy + math.sin(a + i * math.pi) * r * 0.5
-                cv2.circle(layers.sharp, (int(hx), int(hy)), max(1, int(r * 0.06)),
-                           _scale(chakra_color(1.0), 1.0), -1, lineType=cv2.LINE_AA)
+            draw_rasengan(layers, self.x, self.y, self.radius, self.frame)
 
 
 class WindDome:
